@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>闲鱼 AI 砍价</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="page">
+      <header class="hero">
+        <p class="brand">Xianyu Bargain</p>
+        <h1>闲鱼 AI 砍价</h1>
+        <p class="lead">一家一家来：超时跳下一家，有人回就深聊。新链接默认入队。</p>
+      </header>
+
+      <section class="panel">
+        <h2>加入队列</h2>
+        <form id="enqueue-form" class="row">
+          <input
+            id="url-input"
+            type="text"
+            placeholder="粘贴 goofish.com/item?id=... 或纯数字商品 ID"
+            required
+          />
+          <button type="submit">加入队列</button>
+        </form>
+        <p id="enqueue-hint" class="hint" aria-live="polite"></p>
+      </section>
+
+      <section class="panel grid-2">
+        <div>
+          <h2>Worker</h2>
+          <div class="row">
+            <button id="btn-start" type="button">启动</button>
+            <button id="btn-stop" type="button" class="ghost">停止</button>
+          </div>
+          <p id="worker-status" class="hint">状态：未知</p>
+        </div>
+        <div>
+          <h2>设置</h2>
+          <form id="settings-form" class="settings">
+            <label>
+              等待超时（秒）
+              <input id="timeout-input" type="number" min="30" max="900" />
+            </label>
+            <label>
+              最大轮次
+              <input id="rounds-input" type="number" min="1" max="20" />
+            </label>
+            <label class="check">
+              <input id="auto-send-input" type="checkbox" />
+              自动发送
+            </label>
+            <button type="submit">保存设置</button>
+          </form>
+        </div>
+      </section>
+
+      <section class="panel grid-2">
+        <div>
+          <h2>队列</h2>
+          <div id="queue-list" class="list"></div>
+        </div>
+        <div>
+          <h2>当前会话</h2>
+          <div id="session-box" class="session"></div>
+        </div>
+      </section>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

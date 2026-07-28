@@ -1,0 +1,38 @@
+# 环境与密钥
+.env
+.env.*
+!.env.example
+
+# 闲鱼登录态（严禁提交）
+storage_state.json
+**/storage_state.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 本地数据
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+.pytest_tmp/
+
+# 前端构建
+web/node_modules/
+web/dist/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

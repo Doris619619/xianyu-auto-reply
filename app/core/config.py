@@ -1,0 +1,63 @@
+"""
+本文件负责从环境变量读取应用配置。
+
+它属于 core 模块，为 API、Worker、Playwright 与 DeepSeek 提供只读配置。
+不读取登录态内容，不发起网络请求。
+"""
+
+from functools import lru_cache
+
+from pydantic import Field, SecretStr, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """
+    定义应用环境配置。
+
+    输入来自环境变量和可选 `.env`；校验失败时抛出 Pydantic 异常，无外部副作用。
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    database_url: str = "sqlite:///./data/bargain.db"
+    xianyu_storage_state_path: str = "storage_state.json"
+    xianyu_headless: bool = False
+    xianyu_verify_timeout_seconds: int = Field(default=12, ge=5, le=60)
+    xianyu_expected_account_id: str | None = None
+    deepseek_api_key: SecretStr | None = None
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-v4-flash"
+    deepseek_timeout_seconds: float = Field(default=15.0, ge=1.0, le=60.0)
+    app_host: str = "127.0.0.1"
+    app_port: int = Field(default=8787, ge=1, le=65535)
+    default_reply_timeout_seconds: int = Field(default=180, ge=30, le=900)
+    default_max_rounds: int = Field(default=6, ge=1, le=20)
+    default_auto_send: bool = True
+    log_level: str = "INFO"
+
+    @field_validator("deepseek_api_key", mode="before")
+    @classmethod
+    def normalize_optional_secret(cls, value: object) -> object | None:
+        """
+        将空字符串规范化为未配置密钥。
+
+        输入原始环境值；返回原值或 None；不展示 SecretStr 内容。
+        """
+
+        if value is None:
+            return None
+        if isinstance(value, SecretStr):
+            return value if value.get_secret_value().strip() else None
+        return value if str(value).strip() else None
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """
+    返回进程级缓存的配置单例。
+
+    无输入；首次调用时读取环境；后续返回同一实例。测试可调用 ``get_settings.cache_clear()``。
+    """
+
+    return Settings()
