@@ -96,7 +96,9 @@ h1 {
 }
 
 input[type="text"],
-input[type="number"] {
+input[type="number"],
+select,
+textarea {
   flex: 1;
   border: 1px solid var(--line);
   background: rgba(0, 0, 0, 0.25);
@@ -104,6 +106,12 @@ input[type="number"] {
   border-radius: 10px;
   padding: 0.7rem 0.85rem;
   font: inherit;
+}
+
+textarea {
+  width: 100%;
+  min-height: 5.5rem;
+  resize: vertical;
 }
 
 button {
@@ -211,4 +219,20 @@ button.danger {
 .empty {
   color: var(--muted);
   font-size: 0.92rem;
+}
+
+.manual-reply {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.manual-reply label {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }

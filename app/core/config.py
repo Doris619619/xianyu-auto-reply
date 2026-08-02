@@ -6,6 +6,7 @@
 """
 
 from functools import lru_cache
+from urllib.parse import urlparse
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,6 +24,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/bargain.db"
     xianyu_storage_state_path: str = "storage_state.json"
     xianyu_headless: bool = False
+    xianyu_cdp_endpoint: str | None = None
     xianyu_verify_timeout_seconds: int = Field(default=12, ge=5, le=60)
     xianyu_expected_account_id: str | None = None
     deepseek_api_key: SecretStr | None = None
@@ -50,6 +52,27 @@ class Settings(BaseSettings):
         if isinstance(value, SecretStr):
             return value if value.get_secret_value().strip() else None
         return value if str(value).strip() else None
+
+    @field_validator("xianyu_cdp_endpoint")
+    @classmethod
+    def validate_local_cdp_endpoint(cls, value: str | None) -> str | None:
+        """
+        仅允许连接本机 Edge 调试端点，避免把受控会话暴露给远程地址。
+
+        输入可选 HTTP 地址；返回去除空白后的地址；非法地址抛出校验异常；不访问网络。
+        """
+
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip().rstrip("/")
+        parsed = urlparse(normalized)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.port is None
+        ):
+            raise ValueError("XIANYU_CDP_ENDPOINT 必须是带端口的本机 HTTP 地址")
+        return normalized
 
 
 @lru_cache

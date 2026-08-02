@@ -7,8 +7,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
+
+ReplyMode = Literal["ai", "manual"]
 
 
 class EnqueueRequest(BaseModel):
@@ -39,6 +42,7 @@ class QueueItemOut(BaseModel):
     position: int
     position_rank: int | None = None
     seller_id: str | None
+    processing_reply_mode: ReplyMode | None = None
     result_summary: str | None
     fail_code: str | None
     rounds_sent: int
@@ -64,12 +68,30 @@ class WorkerControlResponse(BaseModel):
     message: str
 
 
+class ClearQueueResponse(BaseModel):
+    """清空队列后的结果。"""
+
+    deleted_count: int
+    worker_enabled: bool
+    worker_running: bool
+    message: str
+
+
+class DeleteQueueItemResponse(BaseModel):
+    """单条队列记录彻底删除后的结果。"""
+
+    deleted_id: int
+    was_active: bool
+    message: str
+
+
 class SettingsOut(BaseModel):
     """运行时设置快照。"""
 
     reply_timeout_seconds: int
     max_rounds: int
     auto_send: bool
+    reply_mode: ReplyMode
     worker_enabled: bool
 
 
@@ -79,6 +101,7 @@ class SettingsUpdateRequest(BaseModel):
     reply_timeout_seconds: int | None = Field(default=None, ge=30, le=900)
     max_rounds: int | None = Field(default=None, ge=1, le=20)
     auto_send: bool | None = None
+    reply_mode: ReplyMode | None = None
 
 
 class MessageOut(BaseModel):
@@ -89,9 +112,32 @@ class MessageOut(BaseModel):
     created_at: datetime | None = None
 
 
+class BrowserConnectionOut(BaseModel):
+    """手动回复所需本机 CDP 浏览器连接状态。"""
+
+    configured: bool
+    connected: bool
+    message: str
+
+
 class CurrentSessionResponse(BaseModel):
     """当前锁定会话的面板数据。"""
 
     item: QueueItemOut | None
     messages: list[MessageOut]
     draft_preview: str | None = None
+    manual_send_available: bool = False
+    browser: BrowserConnectionOut | None = None
+
+
+class ManualReplyRequest(BaseModel):
+    """用户确认后发送的一条手动聊天文本。"""
+
+    text: str = Field(min_length=1, max_length=500)
+
+
+class ManualReplyResponse(BaseModel):
+    """手动发送经页面回读确认后的结果。"""
+
+    rounds_sent: int
+    message: str

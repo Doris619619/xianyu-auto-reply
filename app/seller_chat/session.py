@@ -16,9 +16,11 @@ from uuid import uuid4
 
 from app.crawler.chat_client import (
     ChatMessageSnapshot,
+    ChatSendUncertainError,
     PolicyAllowedDraft,
     SendEvidence,
     build_message_fingerprint,
+    normalize_chat_text,
 )
 from app.crawler.chat_runtime import ProcurementChatClient
 from app.seller_chat.guardrails import (
@@ -190,10 +192,23 @@ class SellerChatSession:
             auto_send_enabled=True,
         )
         entries = await self._sync_new_messages()
-        if not any(entry.speaker == "me" for entry in entries):
-            # 发送已被网络证据和本人消息回显双重确认，但可见历史可能因滚动而读不回来；
-            # 至少要保证模型看得到自己刚说过的话，否则下一轮会重复提问。
-            self._transcript.append(TranscriptEntry(speaker="me", text=text))
+        if not any(
+            entry.speaker == "me"
+            and normalize_chat_text(entry.text) == normalize_chat_text(text)
+            for entry in entries
+        ):
+            if entries:
+                raise ChatSendUncertainError(
+                    "confirmed_message_sync_inconsistent",
+                    "已确认本人消息稳定可见，但增量同步返回了不含该消息的其他内容，禁止猜测顺序或自动重试",
+                    evidence.request_evidence,
+                )
+            # 页面适配层已在两秒后从完整消息列表确认同文右侧气泡仍存在。某些闲鱼 React
+            # 刷新会让紧随其后的第二次增量扫描暂时为空；此处只消费已确认的证据，不再伪造
+            # 未确认的本地消息，也不执行第二次发送。
+            entries = (TranscriptEntry(speaker="me", text=normalize_chat_text(text)),)
+            self._transcript.extend(entries)
+            self._latest_fingerprint = evidence.confirmed_message_fingerprint
         seller_texts = tuple(entry.text for entry in entries if entry.speaker == "seller")
         return SendOutcome(evidence=evidence, seller_texts=seller_texts)
 
@@ -205,6 +220,9 @@ class SellerChatSession:
         参数 timeout_seconds 是本轮最长等待秒数；返回卖家新消息，超时返回 None。
         """
 
+        # 每个 Worker 监听周期先刷新一次独立 Chromium 聊天页，不能依赖它恰好收到 WebSocket
+        # 推送；刷新后才从服务端最新消息中读取增量。
+        await self._client.refresh_conversation()
         waited = 0.0
         attempt = 0
         while True:

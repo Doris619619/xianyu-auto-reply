@@ -11,7 +11,14 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from playwright.async_api import Browser, BrowserContext, Page, Playwright, Response, async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    Response,
+    async_playwright,
+)
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from app.core.config import Settings
@@ -41,6 +48,7 @@ class PersistentPlaywrightChatFactory:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
+        self._attached_over_cdp = False
 
     async def start(self) -> None:
         """
@@ -55,15 +63,26 @@ class PersistentPlaywrightChatFactory:
         if self._browser is not None or self._playwright is not None:
             await self.stop()
 
-        state_path = Path(self._settings.xianyu_storage_state_path)
-        if not state_path.is_file():
-            raise ChatSafetyError("login_state_missing", "闲鱼登录态文件不存在")
         try:
             self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(
-                headless=self._settings.xianyu_headless
-            )
-            self._context = await self._browser.new_context(storage_state=str(state_path))
+            if self._settings.xianyu_cdp_endpoint:
+                # 真实 Edge 的调试会话由用户持有；Worker 停止时只能断开，不能关闭其页面。
+                self._browser = await self._playwright.chromium.connect_over_cdp(
+                    self._settings.xianyu_cdp_endpoint
+                )
+                contexts = self._browser.contexts
+                if not contexts:
+                    raise ChatSafetyError("cdp_context_missing", "Edge 调试会话没有可用页面上下文")
+                self._context = contexts[0]
+                self._attached_over_cdp = True
+            else:
+                state_path = Path(self._settings.xianyu_storage_state_path)
+                if not state_path.is_file():
+                    raise ChatSafetyError("login_state_missing", "闲鱼登录态文件不存在")
+                self._browser = await self._playwright.chromium.launch(
+                    headless=self._settings.xianyu_headless
+                )
+                self._context = await self._browser.new_context(storage_state=str(state_path))
         except Exception:
             await self.stop()
             raise
@@ -71,15 +90,16 @@ class PersistentPlaywrightChatFactory:
     async def stop(self) -> None:
         """关闭浏览器与 Playwright；可重复调用。"""
 
-        if self._context is not None:
+        if self._context is not None and not self._attached_over_cdp:
             await self._context.close()
-            self._context = None
-        if self._browser is not None:
+        self._context = None
+        if self._browser is not None and not self._attached_over_cdp:
             await self._browser.close()
-            self._browser = None
+        self._browser = None
         if self._playwright is not None:
             await self._playwright.stop()
             self._playwright = None
+        self._attached_over_cdp = False
 
     @asynccontextmanager
     async def open(
@@ -101,21 +121,24 @@ class PersistentPlaywrightChatFactory:
             await self.start()
         assert self._context is not None
 
-        blocked_reason: str | None = None
-        page: Page | None = None
-        try:
-            page = await self._context.new_page()
-
-            def observe_status(response: Response) -> None:
-                """记录首次风控信号。"""
-
-                nonlocal blocked_reason
-                reason = detect_risk_response(response.url, response.status)
-                if reason and blocked_reason is None:
-                    blocked_reason = reason
-
-            self._context.on("response", observe_status)
+        for attempt in range(2):
+            blocked_reason: str | None = None
+            page: Page | None = None
+            listener_registered = False
+            initialized = False
             try:
+                page = await self._context.new_page()
+
+                def observe_status(response: Response) -> None:
+                    """记录首次风控信号。"""
+
+                    nonlocal blocked_reason
+                    reason = detect_risk_response(response.url, response.status)
+                    if reason and blocked_reason is None:
+                        blocked_reason = reason
+
+                self._context.on("response", observe_status)
+                listener_registered = True
                 async with self._account_guard.hold():
                     navigation = await page.goto(
                         item_url,
@@ -150,20 +173,30 @@ class PersistentPlaywrightChatFactory:
                         "seller_identity_mismatch",
                         "页面卖家身份与任务已锁定卖家不一致",
                     )
+                initialized = True
                 yield OpenedXianyuChat(
                     binding=binding,
                     client=XianyuChatClient(page, binding, self._account_guard),
                 )
+                return
+            except ChatSafetyError:
+                raise
+            except PlaywrightTimeoutError:
+                if attempt == 0 and not initialized:
+                    continue
+                if blocked_reason:
+                    raise ChatSafetyError("http_risk_blocked", blocked_reason) from None
+                raise ChatSafetyError("chat_page_timeout", "闲鱼聊天页面访问超时") from None
+            except Exception as error:
+                # 重试仅覆盖进入会话前的读页面阶段；yield 之后可能已经有发送操作，
+                # 必须原样传播会话内部错误，既不能重试，也不能把 LLM/同步错误误报成页面错误。
+                if initialized:
+                    raise
+                if attempt == 0 and not initialized:
+                    continue
+                raise ChatSafetyError("chat_page_error", "闲鱼聊天页面无法安全确认") from error
             finally:
-                self._context.remove_listener("response", observe_status)
-        except ChatSafetyError:
-            raise
-        except PlaywrightTimeoutError:
-            if blocked_reason:
-                raise ChatSafetyError("http_risk_blocked", blocked_reason) from None
-            raise ChatSafetyError("chat_page_timeout", "闲鱼聊天页面访问超时") from None
-        except Exception:
-            raise ChatSafetyError("chat_page_error", "闲鱼聊天页面无法安全确认") from None
-        finally:
-            if page is not None:
-                await page.close()
+                if listener_registered:
+                    self._context.remove_listener("response", observe_status)
+                if page is not None:
+                    await page.close()

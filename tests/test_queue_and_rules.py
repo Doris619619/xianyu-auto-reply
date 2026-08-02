@@ -115,6 +115,26 @@ def test_only_one_active_claim(session_factory: sessionmaker) -> None:
         assert nxt is not None and nxt.id == b.id
 
 
+def test_reply_mode_is_global_but_claimed_item_keeps_its_mode(
+    session_factory: sessionmaker,
+) -> None:
+    """模式变更仅影响之后领取的会话，已领取项保留启动时的模式。"""
+
+    service = QueueService(session_factory)
+    first = service.enqueue("1067489371533")
+    service.update_settings(reply_mode="manual")
+    with session_factory() as session:
+        claimed = QueueRepository(session).claim_next_queued(reply_mode="manual")
+        assert claimed is not None and claimed.id == first.id
+        assert claimed.processing_reply_mode == "manual"
+    service.update_settings(reply_mode="ai")
+    with session_factory() as session:
+        current = QueueRepository(session).get_item(first.id)
+        assert current is not None
+        assert current.processing_reply_mode == "manual"
+    assert service.get_settings().reply_mode == "ai"
+
+
 def test_prioritize_preempts_active(session_factory: sessionmaker) -> None:
     """优先插队会结束当前 active 并把目标拉到队首。"""
 
@@ -146,3 +166,61 @@ def test_retry_only_parked(session_factory: sessionmaker) -> None:
         repo.mark_status(row, QueueItemStatus.PARKED, summary="timeout")
     retried = service.retry(item.id)
     assert retried.status == QueueItemStatus.QUEUED
+
+
+def test_resume_monitoring_only_allows_failed_item_with_sent_rounds(
+    session_factory: sessionmaker,
+) -> None:
+    """已发消息后监听失败可恢复，未发送的失败项仍不能借此入队。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("1067489371552")
+    with pytest.raises(QueueServiceError):
+        service.resume_monitoring(item.id)
+
+    with session_factory() as session:
+        repo = QueueRepository(session)
+        row = repo.get_item(item.id)
+        assert row is not None
+        repo.bump_rounds(row)
+        repo.mark_status(row, QueueItemStatus.FAILED, summary="监听异常")
+
+    resumed = service.resume_monitoring(item.id)
+    assert resumed.status == QueueItemStatus.QUEUED
+    assert resumed.rounds_sent == 1
+    assert resumed.fail_code is None
+
+
+def test_clear_all_removes_queue_and_session_records(session_factory: sessionmaker) -> None:
+    """清空操作应删除 active/历史队列项及其面板会话记录。"""
+
+    service = QueueService(session_factory)
+    first = service.enqueue("1067489371561")
+    service.enqueue("1067489371562")
+    with session_factory() as session:
+        repo = QueueRepository(session)
+        repo.claim_next_queued()
+        repo.replace_messages(first.id, [("me", "你好")])
+
+    assert service.clear_all() == 2
+    assert service.list_queue().items == []
+    assert service.current_session().item is None
+
+
+def test_delete_item_removes_active_record_and_requests_cancellation(
+    session_factory: sessionmaker,
+) -> None:
+    """删除正在处理的项时，应清除消息并请求 Worker 取消当前会话。"""
+
+    cancellations: list[bool] = []
+    service = QueueService(session_factory, on_stop_active=lambda: cancellations.append(True))
+    item = service.enqueue("1067489371563")
+    with session_factory() as session:
+        repo = QueueRepository(session)
+        repo.claim_next_queued()
+        repo.replace_messages(item.id, [("me", "你好")])
+
+    assert service.delete_item(item.id) is True
+    assert cancellations == [True]
+    assert service.list_queue().items == []
+    assert service.current_session().item is None

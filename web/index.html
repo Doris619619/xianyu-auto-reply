@@ -34,6 +34,7 @@
           <div class="row">
             <button id="btn-start" type="button">启动</button>
             <button id="btn-stop" type="button" class="ghost">停止</button>
+            <button id="btn-clear-queue" type="button" class="danger">清空队列记录</button>
           </div>
           <p id="worker-status" class="hint">状态：未知</p>
         </div>
@@ -48,9 +49,12 @@
               最大轮次
               <input id="rounds-input" type="number" min="1" max="20" />
             </label>
-            <label class="check">
-              <input id="auto-send-input" type="checkbox" />
-              自动发送
+            <label>
+              回复模式
+              <select id="reply-mode-input">
+                <option value="ai">AI 回复</option>
+                <option value="manual">手动回复（连接可见 Chrome）</option>
+              </select>
             </label>
             <button type="submit">保存设置</button>
           </form>
@@ -65,6 +69,15 @@
         <div>
           <h2>当前会话</h2>
           <div id="session-box" class="session"></div>
+          <form id="manual-reply-form" class="manual-reply" hidden>
+            <label for="manual-reply-input">手动回复</label>
+            <textarea id="manual-reply-input" maxlength="500" placeholder="输入要发送给商家的内容"></textarea>
+            <div class="row">
+              <button id="manual-reply-submit" type="submit">确认发送</button>
+              <span id="manual-reply-hint" class="hint"></span>
+            </div>
+          </form>
+          <p id="browser-connection-hint" class="hint"></p>
         </div>
       </section>
     </div>

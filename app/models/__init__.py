@@ -10,7 +10,7 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, func
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine, func, inspect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -46,6 +46,7 @@ class QueueItem(Base):
     status: Mapped[str] = mapped_column(String(32), index=True, default=QueueItemStatus.QUEUED)
     position: Mapped[int] = mapped_column(Integer, index=True, default=0)
     seller_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    processing_reply_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
     result_summary: Mapped[str | None] = mapped_column(String(512), nullable=True)
     fail_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     rounds_sent: Mapped[int] = mapped_column(Integer, default=0)
@@ -85,6 +86,7 @@ class AppSetting(Base):
     reply_timeout_seconds: Mapped[int] = mapped_column(Integer, default=180)
     max_rounds: Mapped[int] = mapped_column(Integer, default=6)
     auto_send: Mapped[bool] = mapped_column(Boolean, default=True)
+    reply_mode: Mapped[str] = mapped_column(String(16), default="ai")
     worker_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -106,8 +108,28 @@ def init_db(database_url: str) -> sessionmaker:
     connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
     _engine = create_engine(database_url, future=True, connect_args=connect_args)
     Base.metadata.create_all(_engine)
+    _upgrade_sqlite_schema(_engine, database_url)
     SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
     return SessionLocal
+
+
+def _upgrade_sqlite_schema(engine, database_url: str) -> None:
+    """为已存在的 SQLite 数据库补充可安全添加的模式字段。"""
+
+    if not database_url.startswith("sqlite"):
+        return
+    inspector = inspect(engine)
+    with engine.begin() as connection:
+        setting_columns = {column["name"] for column in inspector.get_columns("app_settings")}
+        if "reply_mode" not in setting_columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE app_settings ADD COLUMN reply_mode VARCHAR(16) NOT NULL DEFAULT 'ai'"
+            )
+        item_columns = {column["name"] for column in inspector.get_columns("queue_items")}
+        if "processing_reply_mode" not in item_columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE queue_items ADD COLUMN processing_reply_mode VARCHAR(16)"
+            )
 
 
 def get_session_factory() -> sessionmaker:

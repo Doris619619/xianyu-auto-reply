@@ -15,9 +15,6 @@ from typing import Protocol
 from playwright.async_api import Page, Response, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-# 可选恢复钩子：返回 True 表示已处理验证并应重新检查页面风险。
-RiskRecoveryHook = Callable[[Page], Awaitable[bool]]
-
 from app.core.config import Settings
 from app.crawler.chat_client import (
     ChatBinding,
@@ -32,6 +29,9 @@ from app.crawler.chat_client import (
 from app.crawler.risk_control import detect_risk_response
 from app.services.xianyu_account_guard import AccountAccessGuard
 
+# 可选恢复钩子：返回 True 表示已处理验证并应重新检查页面风险。
+RiskRecoveryHook = Callable[[Page], Awaitable[bool]]
+
 
 class ProcurementChatClient(Protocol):
     """
@@ -45,6 +45,9 @@ class ProcurementChatClient(Protocol):
 
     async def read_latest_message(self) -> ChatMessageSnapshot:
         """读取绑定会话最新消息；无页面写入副作用。"""
+
+    async def refresh_conversation(self) -> None:
+        """只读刷新当前绑定聊天页，供卖家回复轮询获取服务端最新状态。"""
 
     async def read_messages_after(
         self,

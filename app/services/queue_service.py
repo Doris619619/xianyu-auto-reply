@@ -84,7 +84,11 @@ class QueueService:
             active = repo.get_active()
             items: list[QueueItemOut] = []
             for item in repo.list_items():
-                rank = repo.queued_position_rank(item) if item.status == QueueItemStatus.QUEUED else None
+                rank = (
+                    repo.queued_position_rank(item)
+                    if item.status == QueueItemStatus.QUEUED
+                    else None
+                )
                 items.append(_to_item_out(item, rank))
             return QueueListResponse(
                 items=items,
@@ -108,6 +112,7 @@ class QueueService:
                 reply_timeout_seconds=row.reply_timeout_seconds,
                 max_rounds=row.max_rounds,
                 auto_send=row.auto_send,
+                reply_mode=row.reply_mode,
                 worker_enabled=row.worker_enabled,
             )
 
@@ -117,6 +122,7 @@ class QueueService:
         reply_timeout_seconds: int | None = None,
         max_rounds: int | None = None,
         auto_send: bool | None = None,
+        reply_mode: str | None = None,
     ) -> SettingsOut:
         """更新运行时设置（不含 worker_enabled）。"""
 
@@ -125,11 +131,13 @@ class QueueService:
                 reply_timeout_seconds=reply_timeout_seconds,
                 max_rounds=max_rounds,
                 auto_send=auto_send,
+                reply_mode=reply_mode,
             )
             return SettingsOut(
                 reply_timeout_seconds=row.reply_timeout_seconds,
                 max_rounds=row.max_rounds,
                 auto_send=row.auto_send,
+                reply_mode=row.reply_mode,
                 worker_enabled=row.worker_enabled,
             )
 
@@ -142,6 +150,7 @@ class QueueService:
                 reply_timeout_seconds=row.reply_timeout_seconds,
                 max_rounds=row.max_rounds,
                 auto_send=row.auto_send,
+                reply_mode=row.reply_mode,
                 worker_enabled=row.worker_enabled,
             )
         if self._on_worker_enabled_change is not None:
@@ -177,6 +186,20 @@ class QueueService:
                 raise QueueServiceError(str(error)) from error
             return _to_item_out(updated, repo.queued_position_rank(updated))
 
+    def resume_monitoring(self, item_id: int) -> QueueItemOut:
+        """恢复已发送失败项的卖家回复监听，不会重新发送开场。"""
+
+        with self._session_factory() as session:
+            repo = QueueRepository(session)
+            item = repo.get_item(item_id)
+            if item is None:
+                raise QueueServiceError("队列项不存在")
+            try:
+                updated = repo.resume_failed_monitoring(item)
+            except ValueError as error:
+                raise QueueServiceError(str(error)) from error
+            return _to_item_out(updated, repo.queued_position_rank(updated))
+
     def stop(self, item_id: int | None = None) -> QueueItemOut | None:
         """
         手动结束指定项或当前 active 项。
@@ -189,7 +212,11 @@ class QueueService:
             item = repo.get_item(item_id) if item_id is not None else repo.get_active()
             if item is None:
                 return None
-            if item.status not in {QueueItemStatus.ACTIVE, QueueItemStatus.QUEUED, QueueItemStatus.PARKED}:
+            if item.status not in {
+                QueueItemStatus.ACTIVE,
+                QueueItemStatus.QUEUED,
+                QueueItemStatus.PARKED,
+            }:
                 raise QueueServiceError("该项已结束，无法再停止")
             updated = repo.mark_status(
                 item,
@@ -201,6 +228,23 @@ class QueueService:
         if self._on_stop_active is not None:
             self._on_stop_active()
         return out
+
+    def clear_all(self) -> int:
+        """清空全部队列项及面板会话记录；调用方须先停止 Worker。"""
+
+        with self._session_factory() as session:
+            return QueueRepository(session).clear_all()
+
+    def delete_item(self, item_id: int) -> bool:
+        """彻底删除一条记录；删除当前会话时通知 Worker 立即取消。"""
+
+        with self._session_factory() as session:
+            was_active = QueueRepository(session).delete_item(item_id)
+        if was_active is None:
+            raise QueueServiceError("队列项不存在")
+        if was_active and self._on_stop_active is not None:
+            self._on_stop_active()
+        return was_active
 
     def current_session(self) -> CurrentSessionResponse:
         """返回当前 active 会话消息。"""
@@ -229,6 +273,7 @@ def _to_item_out(item: QueueItem, rank: int | None) -> QueueItemOut:
         position=item.position,
         position_rank=rank,
         seller_id=item.seller_id,
+        processing_reply_mode=item.processing_reply_mode,
         result_summary=item.result_summary,
         fail_code=item.fail_code,
         rounds_sent=item.rounds_sent,

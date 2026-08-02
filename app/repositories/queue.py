@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.models import AppSetting, QueueItem, QueueItemStatus, SessionMessage
@@ -30,6 +30,7 @@ class QueueRepository:
         reply_timeout_seconds: int,
         max_rounds: int,
         auto_send: bool,
+        reply_mode: str = "ai",
     ) -> AppSetting:
         """
         确保存在唯一一行运行时设置；不存在则按默认值创建。
@@ -41,6 +42,7 @@ class QueueRepository:
                 reply_timeout_seconds=reply_timeout_seconds,
                 max_rounds=max_rounds,
                 auto_send=auto_send,
+                reply_mode=reply_mode,
                 worker_enabled=False,
             )
             self._session.add(row)
@@ -62,6 +64,7 @@ class QueueRepository:
         reply_timeout_seconds: int | None = None,
         max_rounds: int | None = None,
         auto_send: bool | None = None,
+        reply_mode: str | None = None,
         worker_enabled: bool | None = None,
     ) -> AppSetting:
         """按非空字段更新运行时设置并返回最新行。"""
@@ -73,6 +76,8 @@ class QueueRepository:
             row.max_rounds = max_rounds
         if auto_send is not None:
             row.auto_send = auto_send
+        if reply_mode is not None:
+            row.reply_mode = reply_mode
         if worker_enabled is not None:
             row.worker_enabled = worker_enabled
         self._session.commit()
@@ -142,7 +147,7 @@ class QueueRepository:
         )
         return int(ahead or 0) + 1
 
-    def claim_next_queued(self) -> QueueItem | None:
+    def claim_next_queued(self, *, reply_mode: str = "ai") -> QueueItem | None:
         """
         领取 position 最小的 queued 项并标记为 active。
 
@@ -160,6 +165,8 @@ class QueueRepository:
         if item is None:
             return None
         item.status = QueueItemStatus.ACTIVE
+        if item.processing_reply_mode is None:
+            item.processing_reply_mode = reply_mode
         item.waiting_since = None
         item.updated_at = datetime.now(UTC)
         self._session.commit()
@@ -233,8 +240,29 @@ class QueueRepository:
         if item.status != QueueItemStatus.PARKED:
             raise ValueError("只有暂挂项可以重试")
         item.status = QueueItemStatus.QUEUED
+        item.processing_reply_mode = None
         item.position = self.next_position()
         item.result_summary = None
+        item.fail_code = None
+        item.waiting_since = None
+        item.updated_at = datetime.now(UTC)
+        self._session.commit()
+        self._session.refresh(item)
+        return item
+
+    def resume_failed_monitoring(self, item: QueueItem) -> QueueItem:
+        """
+        将已发送过消息但监听失败的项重新入队，只恢复监听而不重发开场。
+
+        仅 ``failed`` 且已有发送轮次的项可恢复；其他失败原因不能借此绕过发送确认边界。
+        """
+
+        if item.status != QueueItemStatus.FAILED or item.rounds_sent < 1:
+            raise ValueError("只有已发过消息的失败项可以恢复监听")
+        item.status = QueueItemStatus.QUEUED
+        item.processing_reply_mode = None
+        item.position = self.next_position()
+        item.result_summary = "恢复监听中，等待卖家新回复"
         item.fail_code = None
         item.waiting_since = None
         item.updated_at = datetime.now(UTC)
@@ -300,6 +328,29 @@ class QueueRepository:
                 .order_by(SessionMessage.id.asc())
             ).all()
         )
+
+    def clear_all(self) -> int:
+        """删除全部队列项及其仅供展示的会话记录，并返回删除的队列项数。"""
+
+        item_count = int(self._session.scalar(select(func.count()).select_from(QueueItem)) or 0)
+        self._session.execute(delete(SessionMessage))
+        self._session.execute(delete(QueueItem))
+        self._session.commit()
+        return item_count
+
+    def delete_item(self, item_id: int) -> bool | None:
+        """彻底删除指定队列项及其会话记录；返回其删除前是否为 active。"""
+
+        item = self.get_item(item_id)
+        if item is None:
+            return None
+        was_active = item.status == QueueItemStatus.ACTIVE
+        self._session.execute(
+            delete(SessionMessage).where(SessionMessage.queue_item_id == item.id)
+        )
+        self._session.delete(item)
+        self._session.commit()
+        return was_active
 
     def recover_interrupted_active(self) -> int:
         """

@@ -48,6 +48,7 @@ SELLER_DIRECTIONS = {"seller", "incoming", "other"}
 MAX_MESSAGE_NODES = 500
 SEND_CONFIRMATION_ATTEMPTS = 40
 SEND_CONFIRMATION_DELAY_MS = 250
+SEND_CONFIRMATION_STABILITY_MS = 2_000
 SEND_POINTER_MOVE_STEPS = 8
 SEND_POINTER_SETTLE_MS = 90
 SEND_POINTER_PRESS_MS = 70
@@ -415,6 +416,30 @@ async def _unique_visible_locator(page: Page, selector: str, label: str) -> Loca
     return visible[0]
 
 
+async def _read_stable_visible_body(page: Page) -> str:
+    """
+    等待 React 重绘结束后读取唯一可见页面主体文本。
+
+    商品页在点击聊天前可能短暂同时保留新旧 ``body`` 节点；本函数最多等待两秒，只有稳定
+    的唯一主体才会继续风险检测。超时仍失败关闭，不会选择任意一个节点猜测页面状态。
+    """
+
+    last_error: ChatSafetyError | None = None
+    for attempt in range(CHAT_ENTRY_STABILITY_ATTEMPTS):
+        try:
+            body = await _unique_visible_locator(page, BODY_SELECTOR, "页面主体")
+            return await body.inner_text(timeout=5_000)
+        except ChatSafetyError as exc:
+            if exc.code != "ambiguous_chat_dom":
+                raise
+            last_error = exc
+        if attempt + 1 < CHAT_ENTRY_STABILITY_ATTEMPTS:
+            await page.wait_for_timeout(CHAT_ENTRY_STABILITY_DELAY_MS)
+    if last_error is not None:
+        raise last_error
+    raise ChatSafetyError("ambiguous_chat_dom", "页面主体必须且只能匹配一个可见元素")
+
+
 async def _read_stable_chat_entry(page: Page) -> tuple[Locator, str]:
     """
     在客户端渲染竞态内读取唯一聊天入口及其非空身份 URL。
@@ -628,8 +653,7 @@ async def discover_chat_binding(
     if not IDENTIFIER_PATTERN.fullmatch(expected_account_id):
         raise ChatSafetyError("invalid_expected_account", "配置账号 ID 不是可确认的稳定标识")
     async with account_guard.hold():
-        body = await _unique_visible_locator(page, BODY_SELECTOR, "页面主体")
-        visible_text = await body.inner_text(timeout=5_000)
+        visible_text = await _read_stable_visible_body(page)
         reason = detect_risk(page.url, visible_text)
         if reason:
             raise ChatSafetyError("risk_or_login_blocked", reason)
@@ -698,6 +722,9 @@ class XianyuChatClient:
 
         # 生产 Playwright BrowserContext 提供 on；离线 FakeContext 不注册网络监听器。
         if hasattr(self._page.context, "on"):
+            # “聊一聊”可能新开聊天页。必须在新页刚创建时就注册 WebSocket 监听，
+            # 否则等 open_conversation 找到该页时，长连接已经建立，后续无法观察发送帧。
+            self._page.context.on("page", self._register_page_send_observers)
             self._page.context.on("response", observe_status)
             self._page.context.on("request", self._observe_send_request)
             self._page.context.on("response", self._observe_send_response)
@@ -844,6 +871,18 @@ class XianyuChatClient:
             await self._assert_chat_ready()
             return await self._read_latest_message_unlocked()
 
+    async def refresh_conversation(self) -> None:
+        """
+        刷新当前绑定聊天页并重新校验身份，读取服务端最新消息。
+
+        无输入和返回；只执行页面刷新，不输入、不点击发送，也不触发任何交易操作。
+        """
+
+        async with self._account_guard.hold():
+            await self._page.reload(wait_until="domcontentloaded", timeout=10_000)
+            await self._assert_bound_identity()
+            await self._assert_chat_ready()
+
     async def read_messages_after(
         self,
         baseline_fingerprint: str,
@@ -876,12 +915,10 @@ class XianyuChatClient:
                     "chat_baseline_not_visible",
                     "消息基线已不在可见历史中，禁止猜测缺失回复",
                 )
-            if len(baseline_indexes) != 1:
-                raise ChatSafetyError(
-                    "chat_baseline_ambiguous",
-                    "可见历史中存在重复基线，禁止猜测消息边界",
-                )
-            return snapshots[baseline_indexes[0] + 1 :]
+            # 基线表示调用方已确认的“最新”消息。闲鱼同文消息常没有稳定 message id，
+            # 因而指纹可能重复；选择时间顺序中最后一次出现，才能从真正最新基线继续监听，
+            # 不会把更早的同文历史误认成新回复。
+            return snapshots[baseline_indexes[-1] + 1 :]
 
     async def send_policy_allowed_draft(
         self,
@@ -1020,13 +1057,12 @@ class XianyuChatClient:
         """
         使用项目统一 ``detect_risk`` 检查登录、验证码和风控可见信号。
 
-        无输入和返回；风险信号或 body 不唯一时抛出 ``ChatSafetyError``；只读取页面。
+        无输入和返回；风险信号或主体两秒内无法稳定时抛出 ``ChatSafetyError``；只读取页面。
         """
 
         if self._blocked_risk_reason:
             raise ChatSafetyError("http_risk_blocked", self._blocked_risk_reason)
-        body = await _unique_visible_locator(self._page, BODY_SELECTOR, "页面主体")
-        visible_text = await body.inner_text(timeout=5_000)
+        visible_text = await _read_stable_visible_body(self._page)
         reason = detect_risk(self._page.url, visible_text)
         if reason:
             raise ChatSafetyError("risk_or_login_blocked", reason)
@@ -1134,25 +1170,18 @@ class XianyuChatClient:
         count = await messages.count()
         if count > MAX_MESSAGE_NODES:
             raise ChatSafetyError("chat_history_too_large", "聊天消息节点数量超出安全上限")
-        snapshots: list[ChatMessageSnapshot] = []
+        positioned_snapshots: list[tuple[float, int, ChatMessageSnapshot]] = []
         for index in range(count):
             candidate = messages.nth(index)
             if await candidate.is_visible():
-                snapshots.append(await _snapshot_message(candidate))
-        message_list = await _unique_visible_locator(
-            self._page,
-            CHAT_MESSAGE_LIST_SELECTOR,
-            "消息列表",
-        )
-        flex_direction = await message_list.evaluate(
-            "(node) => window.getComputedStyle(node).flexDirection"
-        )
-        if flex_direction == "column-reverse":
-            # 真实闲鱼页把最新消息放在 DOM 前部；对外统一返回从旧到新的时间顺序。
-            snapshots.reverse()
-        elif flex_direction != "column":
-            raise ChatSafetyError("message_order_not_confirmed", "无法确认聊天消息排列顺序")
-        return snapshots
+                top = await candidate.evaluate("node => node.getBoundingClientRect().top")
+                if not isinstance(top, (int, float)):
+                    raise ChatSafetyError("message_order_not_confirmed", "无法确认聊天消息页面位置")
+                positioned_snapshots.append((float(top), index, await _snapshot_message(candidate)))
+        # 闲鱼当前消息列表的 flex 声明与实际渲染顺序可不一致。页面从上到下就是从旧到新，
+        # 因而以真实几何位置排序，而不是猜测 CSS flexDirection。
+        positioned_snapshots.sort(key=lambda entry: (entry[0], entry[1]))
+        return [snapshot for _, _, snapshot in positioned_snapshots]
 
     def _assert_unchanged(
         self, latest: ChatMessageSnapshot, expected_latest_fingerprint: str
@@ -1211,23 +1240,20 @@ class XianyuChatClient:
                     and normalize_chat_text(await node.inner_text(timeout=2_000)) == expected
                 ):
                     matching.append(node)
-            if len(matching) > previous_matching_count:
-                message_list = await _unique_visible_locator(
-                    self._page,
-                    CHAT_MESSAGE_LIST_SELECTOR,
-                    "消息列表",
-                )
-                flex_direction = await message_list.evaluate(
-                    "(node) => window.getComputedStyle(node).flexDirection"
-                )
-                if flex_direction not in {"column", "column-reverse"}:
-                    raise ChatSafetyError(
-                        "message_order_not_confirmed",
-                        "无法确认聊天消息排列顺序",
-                    )
-                confirmed = matching[0] if flex_direction == "column-reverse" else matching[-1]
-                return await _snapshot_message(confirmed, forced_direction="self")
-            await self._page.wait_for_timeout(SEND_CONFIRMATION_DELAY_MS)
+                if len(matching) > previous_matching_count:
+                    # 闲鱼客户端会在本地先渲染一个右侧气泡；若服务端未接收，气泡会很快撤销。
+                    # 因此不能把首次出现当作成功，必须确认它在完整消息列表中稳定保留。
+                    await self._page.wait_for_timeout(SEND_CONFIRMATION_STABILITY_MS)
+                    stable_messages = await self._read_visible_messages_unlocked()
+                    stable_matches = [
+                        message
+                        for message in stable_messages
+                        if message.direction == "self"
+                        and normalize_chat_text(message.text) == expected
+                    ]
+                    if len(stable_matches) > previous_matching_count:
+                        return stable_matches[-1]
+                await self._page.wait_for_timeout(SEND_CONFIRMATION_DELAY_MS)
         raise ChatSafetyError(
             "send_confirmation_missing",
             "提交发送后未能确认本人同文消息，禁止自动重试",

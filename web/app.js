@@ -67,11 +67,19 @@ async function refreshQueue() {
           `<button class="small" data-act="retry" data-id="${item.id}">重试</button>`
         );
       }
+      if (item.status === "failed" && item.rounds_sent > 0) {
+        actions.push(
+          `<button class="small" data-act="resume-monitoring" data-id="${item.id}">恢复监听</button>`
+        );
+      }
       if (["queued", "active", "parked"].includes(item.status)) {
         actions.push(
           `<button class="small danger" data-act="stop" data-id="${item.id}">结束</button>`
         );
       }
+      actions.push(
+        `<button class="small danger" data-act="delete" data-id="${item.id}">彻底删除</button>`
+      );
       return `<article class="item">
         <div class="item-head">
           <strong>${item.title || item.item_id}</strong>
@@ -88,8 +96,13 @@ async function refreshQueue() {
 async function refreshSession() {
   const data = await api("/api/session/current");
   const box = $("session-box");
+  const form = $("manual-reply-form");
+  const submit = $("manual-reply-submit");
+  const browserHint = $("browser-connection-hint");
+  browserHint.textContent = data.browser?.message || "";
   if (!data.item) {
     box.innerHTML = '<p class="empty">当前没有锁定会话。</p>';
+    form.hidden = true;
     return;
   }
   const msgs = data.messages.length
@@ -100,13 +113,20 @@ async function refreshSession() {
         .join("")
     : '<p class="empty">还没有消息。</p>';
   box.innerHTML = `<div class="hint" style="margin-bottom:.6rem">商品 ${data.item.item_id} · ${statusLabel[data.item.status]}</div>${msgs}`;
+  const manual = data.item.processing_reply_mode === "manual";
+  form.hidden = !manual;
+  submit.disabled = !data.manual_send_available;
+  $("manual-reply-input").disabled = !data.manual_send_available;
+  if (manual && !data.manual_send_available) {
+    $("manual-reply-hint").textContent = "正在等待会话就绪或上一条发送确认";
+  }
 }
 
 async function refreshSettings() {
   const s = await api("/api/settings");
   $("timeout-input").value = s.reply_timeout_seconds;
   $("rounds-input").value = s.max_rounds;
-  $("auto-send-input").checked = s.auto_send;
+  $("reply-mode-input").value = s.reply_mode;
 }
 
 function escapeHtml(text) {
@@ -139,7 +159,7 @@ $("settings-form").addEventListener("submit", async (event) => {
     body: JSON.stringify({
       reply_timeout_seconds: Number($("timeout-input").value),
       max_rounds: Number($("rounds-input").value),
-      auto_send: $("auto-send-input").checked,
+      reply_mode: $("reply-mode-input").value,
     }),
   });
   $("enqueue-hint").textContent = "设置已保存";
@@ -161,19 +181,71 @@ $("btn-stop").addEventListener("click", async () => {
   await refreshQueue();
 });
 
+$("manual-reply-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $("manual-reply-input");
+  const submit = $("manual-reply-submit");
+  const hint = $("manual-reply-hint");
+  const text = input.value.trim();
+  if (!text) {
+    hint.textContent = "请输入要发送的内容";
+    return;
+  }
+  if (!window.confirm("确认把这条内容发送给当前商家吗？")) return;
+  submit.disabled = true;
+  input.disabled = true;
+  hint.textContent = "正在等待聊天页面确认发送…";
+  try {
+    const result = await api("/api/session/manual-reply", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+    input.value = "";
+    hint.textContent = `${result.message}（第 ${result.rounds_sent} 轮）`;
+  } catch (error) {
+    hint.textContent = error.message;
+  } finally {
+    await Promise.all([refreshQueue(), refreshSession()]);
+  }
+});
+
+$("btn-clear-queue").addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "将先停止 Worker，再永久删除所有队列和会话记录。此操作无法恢复，确定继续吗？"
+  );
+  if (!confirmed) return;
+  try {
+    const res = await api("/api/items", { method: "DELETE" });
+    $("worker-status").textContent = res.message;
+    await Promise.all([refreshQueue(), refreshSession()]);
+  } catch (error) {
+    $("worker-status").textContent = error.message;
+  }
+});
+
 $("queue-list").addEventListener("click", async (event) => {
   const btn = event.target.closest("button[data-act]");
   if (!btn) return;
   const id = btn.dataset.id;
   const act = btn.dataset.act;
+  if (
+    act === "delete" &&
+    !window.confirm("将永久删除这条记录及其会话内容，无法恢复。确定继续吗？")
+  ) {
+    return;
+  }
   const path =
     act === "prioritize"
       ? `/api/items/${id}/prioritize`
       : act === "retry"
         ? `/api/items/${id}/retry`
-        : `/api/items/${id}/stop`;
+        : act === "resume-monitoring"
+          ? `/api/items/${id}/resume-monitoring`
+        : act === "delete"
+          ? `/api/items/${id}`
+          : `/api/items/${id}/stop`;
   try {
-    await api(path, { method: "POST", body: "{}" });
+    await api(path, act === "delete" ? { method: "DELETE" } : { method: "POST", body: "{}" });
     await refreshQueue();
     await refreshSession();
   } catch (error) {
