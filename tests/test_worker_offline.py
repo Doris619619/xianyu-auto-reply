@@ -23,6 +23,7 @@ from app.crawler.chat_client import (
     ChatSafetyError,
     ChatSendUncertainError,
     PolicyAllowedDraft,
+    SendAttemptDiagnostic,
     SendEvidence,
     SendRequestEvidence,
     build_message_fingerprint,
@@ -165,6 +166,15 @@ class UnconfirmedFakeChatClient(FakeChatClient):
             "send_confirmation_missing",
             "本人消息未能稳定回读",
             SendRequestEvidence(request_observed=False),
+            SendAttemptDiagnostic(
+                phase="confirmation_timeout",
+                button_center_obscured=False,
+                click_attempted=True,
+                confirmation_observed=False,
+                risk_detected_after_click=False,
+                last_safety_code="send_confirmation_missing",
+                request_evidence=SendRequestEvidence(request_observed=False),
+            ),
         )
 
 
@@ -404,8 +414,47 @@ async def test_unconfirmed_send_is_not_persisted_as_sent(session_factory: sessio
         assert row is not None
         assert row.status == QueueItemStatus.FAILED
         assert row.fail_code == "send_confirmation_missing"
+        assert row.result_summary == "点击后未确认本人消息回显，已停止且不会自动重试"
         assert row.rounds_sent == 0
+        assert row.send_diagnostic is not None
+        assert "你好" not in row.send_diagnostic
+        assert ACCOUNT not in row.send_diagnostic
         assert repo.list_messages(item.id) == []
+
+    output = service.list_queue().items[0]
+    assert output.send_diagnostic is not None
+    assert output.send_diagnostic.phase == "confirmation_timeout"
+    assert output.send_diagnostic.button_center_obscured is False
+    assert output.send_diagnostic.click_attempted is True
+    assert output.send_diagnostic.confirmation_observed is False
+
+
+def test_send_diagnostic_serialization_never_includes_network_endpoint_or_message() -> None:
+    """持久化诊断仅保留请求是否出现和响应粗粒度状态。"""
+
+    diagnostic = SendAttemptDiagnostic(
+        phase="risk_detected_after_click",
+        button_center_obscured=False,
+        click_attempted=True,
+        confirmation_observed=False,
+        risk_detected_after_click=True,
+        last_safety_code="risk_or_login_blocked",
+        request_evidence=SendRequestEvidence(
+            request_observed=True,
+            transport="http",
+            endpoint_sha256="f" * 64,
+            method="POST",
+            response_observed=True,
+            response_status=403,
+        ),
+    )
+
+    serialized = diagnostic.as_persisted_json()
+    assert "endpoint_sha256" not in serialized
+    assert "method" not in serialized
+    assert "Cookie" not in serialized
+    assert "老板" not in serialized
+    assert '"response_status":403' in serialized
 
 
 @pytest.mark.asyncio

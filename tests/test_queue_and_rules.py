@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,21 @@ def test_parse_item_reference_strips_tracking() -> None:
     ref = parse_item_reference(LIVE_TEST_URL)
     assert ref.item_id == LIVE_TEST_ITEM_ID
     assert ref.detail_url == f"https://www.goofish.com/item?id={LIVE_TEST_ITEM_ID}"
+
+
+def test_init_db_upgrades_legacy_queue_table_with_send_diagnostic(tmp_path: Path) -> None:
+    """已有 SQLite 库启动时应无损增加发送诊断字段。"""
+
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE queue_items (id INTEGER PRIMARY KEY)")
+
+    init_db(f"sqlite:///{db_path.as_posix()}")
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(queue_items)")}
+    assert "processing_reply_mode" in columns
+    assert "send_diagnostic" in columns
 
 
 def test_parse_item_id_only() -> None:

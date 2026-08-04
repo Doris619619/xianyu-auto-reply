@@ -15,6 +15,7 @@ SQLite 默认路径：`./data/bargain.db`（可用 `DATABASE_URL` 覆盖）。
 | seller_id | 页面发现的卖家 ID |
 | result_summary | 结果摘要 |
 | fail_code | 稳定原因码 |
+| send_diagnostic | 发送结果不确定时的脱敏诊断 JSON；不保存消息、Cookie、账号或卖家信息 |
 | rounds_sent | 已发送轮次 |
 | waiting_since | 开始等待卖家的时间 |
 
@@ -27,6 +28,10 @@ SQLite 默认路径：`./data/bargain.db`（可用 `DATABASE_URL` 覆盖）。
 - `done_refused` 明确不降  
 - `done_manual` 手动结束 / 被插队 / 达轮次上限  
 - `failed` 风控、发送不确定、草稿拦截等  
+
+`send_diagnostic` 只会记录一次唯一点击的阶段、发送按钮中心是否被遮挡、是否在点击后检测到
+风险页、是否确认到本人消息回显，以及粗粒度网络响应状态。诊断失败不会触发再次点击、Enter
+回退或自动重试。
 
 ## `session_messages`
 

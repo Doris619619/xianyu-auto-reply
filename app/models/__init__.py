@@ -49,6 +49,7 @@ class QueueItem(Base):
     processing_reply_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
     result_summary: Mapped[str | None] = mapped_column(String(512), nullable=True)
     fail_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    send_diagnostic: Mapped[str | None] = mapped_column(Text, nullable=True)
     rounds_sent: Mapped[int] = mapped_column(Integer, default=0)
     waiting_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -130,6 +131,8 @@ def _upgrade_sqlite_schema(engine, database_url: str) -> None:
             connection.exec_driver_sql(
                 "ALTER TABLE queue_items ADD COLUMN processing_reply_mode VARCHAR(16)"
             )
+        if "send_diagnostic" not in item_columns:
+            connection.exec_driver_sql("ALTER TABLE queue_items ADD COLUMN send_diagnostic TEXT")
 
 
 def get_session_factory() -> sessionmaker:

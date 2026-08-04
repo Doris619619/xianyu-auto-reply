@@ -31,6 +31,22 @@ class EnqueueResponse(BaseModel):
     message: str
 
 
+class SendDiagnosticOut(BaseModel):
+    """发送不确定时的脱敏诊断快照。"""
+
+    schema_version: int
+    phase: str
+    button_center_obscured: bool | None
+    click_attempted: bool
+    confirmation_observed: bool
+    risk_detected_after_click: bool
+    last_safety_code: str | None
+    request_observed: bool
+    transport: str | None
+    response_observed: bool
+    response_status: int | None
+
+
 class QueueItemOut(BaseModel):
     """队列项对外快照。"""
 
@@ -45,6 +61,7 @@ class QueueItemOut(BaseModel):
     processing_reply_mode: ReplyMode | None = None
     result_summary: str | None
     fail_code: str | None
+    send_diagnostic: SendDiagnosticOut | None = None
     rounds_sent: int
     waiting_since: datetime | None
     created_at: datetime | None

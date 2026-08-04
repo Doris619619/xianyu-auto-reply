@@ -7,6 +7,7 @@ Worker 启停通过回调通知，避免 API 直接依赖 Worker 实现细节。
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 
 from sqlalchemy.orm import sessionmaker
@@ -19,6 +20,7 @@ from app.schemas.queue import (
     MessageOut,
     QueueItemOut,
     QueueListResponse,
+    SendDiagnosticOut,
     SettingsOut,
 )
 from app.seller_chat.item_url import ItemUrlError, parse_item_reference
@@ -276,8 +278,20 @@ def _to_item_out(item: QueueItem, rank: int | None) -> QueueItemOut:
         processing_reply_mode=item.processing_reply_mode,
         result_summary=item.result_summary,
         fail_code=item.fail_code,
+        send_diagnostic=_parse_send_diagnostic(item.send_diagnostic),
         rounds_sent=item.rounds_sent,
         waiting_since=item.waiting_since,
         created_at=item.created_at,
         updated_at=item.updated_at,
     )
+
+
+def _parse_send_diagnostic(value: str | None) -> SendDiagnosticOut | None:
+    """解析数据库中的脱敏发送诊断；损坏的历史记录不影响队列读取。"""
+
+    if not value:
+        return None
+    try:
+        return SendDiagnosticOut.model_validate_json(value)
+    except (ValueError, json.JSONDecodeError):
+        return None

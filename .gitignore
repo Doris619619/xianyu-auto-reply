@@ -6,6 +6,8 @@
 # 闲鱼登录态（严禁提交）
 storage_state.json
 **/storage_state.json
+data/browser_states/
+*_storage_state.json
 
 # Python
 __pycache__/
@@ -19,6 +21,7 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.tmp-*.log
 
 # 本地数据
 data/*.db

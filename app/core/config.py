@@ -6,10 +6,17 @@
 """
 
 from functools import lru_cache
+from pathlib import Path
 from urllib.parse import urlparse
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.crawler.browser_backends.storage import (
+    BrowserBackend,
+    SUPPORTED_BROWSER_BACKENDS,
+    resolve_storage_state_path,
+)
 
 
 class Settings(BaseSettings):
@@ -22,7 +29,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     database_url: str = "sqlite:///./data/bargain.db"
-    xianyu_storage_state_path: str = "storage_state.json"
+    xianyu_browser_backend: BrowserBackend = "chromium"
+    xianyu_storage_state_path: str | None = None
     xianyu_headless: bool = False
     xianyu_cdp_endpoint: str | None = None
     xianyu_verify_timeout_seconds: int = Field(default=12, ge=5, le=60)
@@ -37,6 +45,38 @@ class Settings(BaseSettings):
     default_max_rounds: int = Field(default=6, ge=1, le=20)
     default_auto_send: bool = True
     log_level: str = "INFO"
+
+    @field_validator("xianyu_browser_backend", mode="before")
+    @classmethod
+    def normalize_browser_backend(cls, value: object) -> object:
+        """
+        规范化浏览器后端名称并拒绝非法值。
+
+        输入原始环境值；返回小写后端名；非法值抛出 ValueError。
+        """
+
+        if value is None:
+            return "chromium"
+        text = str(value).strip().lower()
+        if text not in SUPPORTED_BROWSER_BACKENDS:
+            raise ValueError(
+                "XIANYU_BROWSER_BACKEND 必须是 chromium、camoufox 或 cloakbrowser"
+            )
+        return text
+
+    @field_validator("xianyu_storage_state_path", mode="before")
+    @classmethod
+    def normalize_optional_storage_path(cls, value: object) -> object | None:
+        """
+        将空字符串规范化为未配置路径，以便按后端使用默认分文件。
+
+        输入原始环境值；返回非空字符串或 None。
+        """
+
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
     @field_validator("deepseek_api_key", mode="before")
     @classmethod
@@ -73,6 +113,18 @@ class Settings(BaseSettings):
         ):
             raise ValueError("XIANYU_CDP_ENDPOINT 必须是带端口的本机 HTTP 地址")
         return normalized
+
+    def resolved_storage_state_path(self) -> Path:
+        """
+        按当前浏览器后端解析登录态文件路径。
+
+        无输入；返回 Path；不检查文件是否存在，也不读取文件内容。
+        """
+
+        return resolve_storage_state_path(
+            backend=self.xianyu_browser_backend,
+            configured_path=self.xianyu_storage_state_path,
+        )
 
 
 @lru_cache

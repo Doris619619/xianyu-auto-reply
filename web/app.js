@@ -36,6 +36,17 @@ function $(id) {
   return document.getElementById(id);
 }
 
+function sendDiagnosticHint(diagnostic) {
+  if (!diagnostic) return "";
+  const parts = ["发送诊断：" + diagnostic.phase];
+  if (diagnostic.button_center_obscured === true) {
+    parts.push("按钮中心被遮挡，未找到其他安全点击区域");
+  }
+  if (diagnostic.risk_detected_after_click === true) parts.push("点击后检测到风险页");
+  if (diagnostic.confirmation_observed === false) parts.push("未确认本人消息回显");
+  return `<div class="hint">${escapeHtml(parts.join(" · "))}</div>`;
+}
+
 async function refreshQueue() {
   const data = await api("/api/items");
   const running = data.worker_running === true;
@@ -87,6 +98,7 @@ async function refreshQueue() {
         </div>
         <div class="hint">ID ${item.item_id} · 已发 ${item.rounds_sent} 轮
           ${item.result_summary ? " · " + item.result_summary : ""}</div>
+        ${sendDiagnosticHint(item.send_diagnostic)}
         <div class="item-actions">${actions.join("")}</div>
       </article>`;
     })
