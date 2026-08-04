@@ -30,7 +30,7 @@ from app.seller_chat.guardrails import (
 )
 from app.seller_chat.llm import SellerChatDraftGenerator, TranscriptEntry
 
-# 等卖家回复的退避节奏：先密后疏，避免长时间高频刷新聊天页引来风控。
+# 等卖家回复的退避节奏：先密后疏，只读聊天 DOM，不执行整页刷新。
 SELLER_REPLY_POLL_BACKOFF_SECONDS: tuple[float, ...] = (2.0, 3.0, 5.0, 8.0, 12.0, 15.0)
 
 SLEEP_CALLABLE = Callable[[float], Awaitable[None]]
@@ -220,9 +220,6 @@ class SellerChatSession:
         参数 timeout_seconds 是本轮最长等待秒数；返回卖家新消息，超时返回 None。
         """
 
-        # 每个 Worker 监听周期先刷新一次独立 Chromium 聊天页，不能依赖它恰好收到 WebSocket
-        # 推送；刷新后才从服务端最新消息中读取增量。
-        await self._client.refresh_conversation()
         waited = 0.0
         attempt = 0
         while True:

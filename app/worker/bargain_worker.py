@@ -17,7 +17,11 @@ from typing import Any, Protocol
 
 from sqlalchemy.orm import sessionmaker
 
-from app.crawler.chat_client import ChatSafetyError, ChatSendUncertainError
+from app.crawler.chat_client import (
+    ChatSafetyError,
+    ChatSendUncertainError,
+    SendAttemptDiagnostic,
+)
 from app.crawler.chat_runtime import OpenedXianyuChat
 from app.models import QueueItemStatus
 from app.repositories.queue import QueueRepository
@@ -33,6 +37,18 @@ from app.services.xianyu_account_guard import normalize_account_guard
 logger = logging.getLogger(__name__)
 
 SLEEP_CALLABLE = Callable[[float], Awaitable[None]]
+
+
+def _send_uncertain_summary(code: str) -> str:
+    """按稳定发送失败码生成不含聊天内容的人工处置提示。"""
+
+    if code == "chat_send_button_obscured":
+        return "发送按钮没有可安全点击的可见区域，已停止且未点击"
+    if code in {"risk_or_login_blocked", "http_risk_blocked"}:
+        return "点击后出现风险或登录提示，已停止且不会自动重试"
+    if code == "send_confirmation_missing":
+        return "点击后未确认本人消息回显，已停止且不会自动重试"
+    return "发送结果无法确认，已停止且不会自动重试"
 
 
 @dataclass(slots=True)
@@ -241,7 +257,14 @@ class BargainWorker:
             item = repo.get_active() or repo.claim_next_queued(reply_mode=settings.reply_mode)
             return item.id if item else None
 
-    def _fail_item(self, item_id: int, *, code: str, summary: str) -> None:
+    def _fail_item(
+        self,
+        item_id: int,
+        *,
+        code: str,
+        summary: str,
+        send_diagnostic: str | None = None,
+    ) -> None:
         """将项标记为 failed。"""
 
         with self.session_factory() as session:
@@ -249,7 +272,13 @@ class BargainWorker:
             item = repo.get_item(item_id)
             if item is None or item.status != QueueItemStatus.ACTIVE:
                 return
-            repo.mark_status(item, QueueItemStatus.FAILED, summary=summary, fail_code=code)
+            repo.mark_status(
+                item,
+                QueueItemStatus.FAILED,
+                summary=summary,
+                fail_code=code,
+                send_diagnostic=send_diagnostic,
+            )
 
     def _should_abort(self, item_id: int) -> bool:
         """外部取消或状态已非 active 时返回 True。"""
@@ -334,10 +363,20 @@ class BargainWorker:
                         already_sent_rounds=already_sent_rounds,
                     )
         except ChatSendUncertainError as error:
+            diagnostic = error.diagnostic or SendAttemptDiagnostic(
+                phase="diagnostic_unavailable",
+                button_center_obscured=None,
+                click_attempted=False,
+                confirmation_observed=False,
+                risk_detected_after_click=False,
+                last_safety_code=getattr(error, "code", "send_uncertain"),
+                request_evidence=error.request_evidence,
+            )
             self._fail_item(
                 item_id,
                 code=getattr(error, "code", "send_uncertain"),
-                summary="发送结果无法确认，已停止且不会自动重试",
+                summary=_send_uncertain_summary(getattr(error, "code", "send_uncertain")),
+                send_diagnostic=diagnostic.as_persisted_json(),
             )
         except ChatSafetyError as error:
             code = getattr(error, "code", "chat_safety")
@@ -716,15 +755,28 @@ def build_default_worker(session_factory: sessionmaker) -> BargainWorker:
     """
 
     from app.core.config import get_settings
+    from app.crawler.browser_backends.factory import (
+        create_ai_browser_session,
+        create_manual_cdp_session,
+    )
     from app.crawler.persistent_chat import PersistentPlaywrightChatFactory
 
     config = load_spike_config(settings=get_settings(), headless=get_settings().xianyu_headless)
     guard = normalize_account_guard(None)
-    ai_settings = config.settings.model_copy(update={"xianyu_cdp_endpoint": None})
-    factory = PersistentPlaywrightChatFactory(ai_settings, guard)
+    ai_session = create_ai_browser_session(config.settings)
+    factory = PersistentPlaywrightChatFactory(
+        config.settings,
+        guard,
+        browser_session=ai_session,
+    )
+    manual_session = create_manual_cdp_session(config.settings)
     manual_factory = (
-        PersistentPlaywrightChatFactory(config.settings, guard)
-        if config.settings.xianyu_cdp_endpoint
+        PersistentPlaywrightChatFactory(
+            config.settings,
+            guard,
+            browser_session=manual_session,
+        )
+        if manual_session is not None
         else None
     )
     generator = SellerChatDraftGenerator(config.deepseek)

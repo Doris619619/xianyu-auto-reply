@@ -1,7 +1,8 @@
 """
-本文件从本地 storage_state.json 打印 tracknick 的 SHA-256，供配置账号指纹。
+本文件从本地登录态打印 tracknick 的 SHA-256，供配置账号指纹。
 
-它属于 scripts，只读登录态文件并输出指纹；不启动浏览器、不访问网络。
+它属于 scripts，按当前浏览器后端解析登录态路径后只读文件并输出指纹；
+不启动浏览器、不访问网络。
 """
 
 from __future__ import annotations
@@ -9,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
-from pathlib import Path
 
 from app.core.config import get_settings
 
@@ -21,9 +21,15 @@ def main() -> int:
     成功返回 0；文件缺失或找不到 Cookie 时返回非 0。
     """
 
-    path = Path(get_settings().xianyu_storage_state_path)
+    settings = get_settings()
+    path = settings.resolved_storage_state_path()
     if not path.is_file():
-        print(f"登录态不存在：{path}。请先运行 scripts/login_xianyu.py", file=sys.stderr)
+        print(
+            f"登录态不存在：{path}。"
+            f"请先在 XIANYU_BROWSER_BACKEND={settings.xianyu_browser_backend} "
+            "下运行 scripts/login_xianyu.py",
+            file=sys.stderr,
+        )
         return 1
     data = json.loads(path.read_text(encoding="utf-8"))
     cookies = data.get("cookies") or []

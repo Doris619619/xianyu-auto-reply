@@ -72,11 +72,12 @@ def load_spike_config(
             "刷新登录态，再运行 python scripts/print_account_fingerprint.py。"
         )
 
-    storage_state_path = Path(resolved.xianyu_storage_state_path)
+    storage_state_path = resolved.resolved_storage_state_path()
     if not storage_state_path.is_file():
         raise SpikeConfigError(
             f"闲鱼登录态文件不存在：{storage_state_path}。"
-            "请先运行 scripts/login_xianyu.py 完成人工登录并生成登录态。"
+            "请先运行 scripts/login_xianyu.py 完成人工登录并生成登录态"
+            f"（当前 XIANYU_BROWSER_BACKEND={resolved.xianyu_browser_backend}）。"
         )
 
     try:

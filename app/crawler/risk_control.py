@@ -1,7 +1,6 @@
 """
 本文件识别登录失效、访问限制和异常页面。
 
-它属于 crawler 模块，只分类风险信号，不尝试验证码、重试或绕过限制。
 """
 
 from app.crawler.selectors import LOGIN_URL_FRAGMENTS, RISK_TEXT_SIGNALS

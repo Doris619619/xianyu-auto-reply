@@ -63,6 +63,21 @@ ALLOWED_SEND_REQUEST_HOST_SUFFIXES = (
     "taobao.com",
     "alibaba.com",
 )
+SEND_BUTTON_HIT_TEST_SCRIPT = """(button, point) => {
+    const top = document.elementFromPoint(point.x, point.y);
+    return Boolean(top && (top === button || button.contains(top)));
+}"""
+SEND_BUTTON_CLICK_FRACTIONS = (
+    (0.5, 0.5),
+    (0.2, 0.5),
+    (0.8, 0.5),
+    (0.5, 0.2),
+    (0.5, 0.8),
+    (0.2, 0.2),
+    (0.8, 0.2),
+    (0.2, 0.8),
+    (0.8, 0.8),
+)
 
 
 class ChatSafetyError(RiskControlBlocked):
@@ -100,6 +115,46 @@ class SendRequestEvidence:
     response_status: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SendAttemptDiagnostic:
+    """
+    保存一次不确定发送的最小页面诊断。
+
+    诊断只描述点击和确认阶段的布尔状态，以及已有的脱敏网络证据；绝不包含消息正文、
+    Cookie、页面文本、账号或卖家标识。该对象可安全持久化到队列项并展示在本地面板。
+    """
+
+    phase: str
+    button_center_obscured: bool | None
+    click_attempted: bool
+    confirmation_observed: bool
+    risk_detected_after_click: bool
+    last_safety_code: str | None
+    request_evidence: SendRequestEvidence
+
+    def as_persisted_json(self) -> str:
+        """返回可持久化的脱敏 JSON，不读取页面也不包含任何聊天内容。"""
+
+        return json.dumps(
+            {
+                "schema_version": 1,
+                "phase": self.phase,
+                "button_center_obscured": self.button_center_obscured,
+                "click_attempted": self.click_attempted,
+                "confirmation_observed": self.confirmation_observed,
+                "risk_detected_after_click": self.risk_detected_after_click,
+                "last_safety_code": self.last_safety_code,
+                "request_observed": self.request_evidence.request_observed,
+                "transport": self.request_evidence.transport,
+                "response_observed": self.request_evidence.response_observed,
+                "response_status": self.request_evidence.response_status,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+
 class ChatSendUncertainError(ChatSafetyError):
     """
     表示唯一鼠标提交后的网络或页面结果无法同时确认。
@@ -112,6 +167,7 @@ class ChatSendUncertainError(ChatSafetyError):
         code: str,
         message: str,
         request_evidence: SendRequestEvidence,
+        diagnostic: SendAttemptDiagnostic | None = None,
     ) -> None:
         """
         保存稳定错误码与脱敏网络证据。
@@ -121,6 +177,7 @@ class ChatSendUncertainError(ChatSafetyError):
 
         super().__init__(code, message)
         self.request_evidence = request_evidence
+        self.diagnostic = diagnostic
 
 
 @dataclass(slots=True)
@@ -154,6 +211,47 @@ class _ActiveSendObservation:
             method=self.method,
             response_observed=self.response_observed,
             response_status=self.response_status,
+        )
+
+
+@dataclass(slots=True)
+class _SendAttemptState:
+    """在一次唯一点击内累积可持久化的脱敏页面诊断。"""
+
+    phase: str = "prepared"
+    button_center_obscured: bool | None = None
+    click_attempted: bool = False
+    confirmation_observed: bool = False
+    risk_detected_after_click: bool = False
+    last_safety_code: str | None = None
+
+    def record_safety_error(self, code: str) -> None:
+        """按稳定错误码记录失败阶段，不保留页面原文。"""
+
+        self.last_safety_code = code
+        if code == "chat_send_button_obscured":
+            self.phase = "button_obscured"
+        elif code == "send_confirmation_missing":
+            self.phase = "confirmation_timeout"
+        elif self.click_attempted and code in {"risk_or_login_blocked", "http_risk_blocked"}:
+            self.phase = "risk_detected_after_click"
+            self.risk_detected_after_click = True
+        elif self.click_attempted:
+            self.phase = "safety_failed_after_click"
+        else:
+            self.phase = "safety_failed_before_click"
+
+    def snapshot(self, request_evidence: SendRequestEvidence) -> SendAttemptDiagnostic:
+        """冻结当前诊断状态，以供异常路径安全持久化。"""
+
+        return SendAttemptDiagnostic(
+            phase=self.phase,
+            button_center_obscured=self.button_center_obscured,
+            click_attempted=self.click_attempted,
+            confirmation_observed=self.confirmation_observed,
+            risk_detected_after_click=self.risk_detected_after_click,
+            last_safety_code=self.last_safety_code,
+            request_evidence=request_evidence,
         )
 
 
@@ -871,18 +969,6 @@ class XianyuChatClient:
             await self._assert_chat_ready()
             return await self._read_latest_message_unlocked()
 
-    async def refresh_conversation(self) -> None:
-        """
-        刷新当前绑定聊天页并重新校验身份，读取服务端最新消息。
-
-        无输入和返回；只执行页面刷新，不输入、不点击发送，也不触发任何交易操作。
-        """
-
-        async with self._account_guard.hold():
-            await self._page.reload(wait_until="domcontentloaded", timeout=10_000)
-            await self._assert_bound_identity()
-            await self._assert_chat_ready()
-
     async def read_messages_after(
         self,
         baseline_fingerprint: str,
@@ -967,30 +1053,43 @@ class XianyuChatClient:
             _, send_button = await self._assert_chat_ready()
             await self._assert_send_button_ready(send_button)
             observation = _ActiveSendObservation(draft_text=draft.text)
+            attempt = _SendAttemptState()
             self._active_send_observation = observation
             try:
                 # 只执行一次可见鼠标轨迹点击；不注入脚本点击、不回退 Enter，也不再次点击。
-                await self._click_send_button_with_mouse(send_button)
+                await self._click_send_button_with_mouse(send_button, attempt)
+                attempt.phase = "waiting_confirmation"
                 confirmation = await self._wait_for_own_confirmation(
                     draft.text,
                     own_count_before,
                 )
+                attempt.confirmation_observed = True
+                attempt.phase = "confirmation_observed"
                 # 本人同文回显是发送成功的硬证据。网络侧明文载荷匹配是增强证据；
                 # 闲鱼常把正文放进加密/二进制帧，抓不到请求时不得把已回显消息判失败。
                 request_evidence = await self._wait_for_send_request_evidence(observation)
             except ChatSendUncertainError:
                 raise
             except ChatSafetyError as exc:
+                attempt.record_safety_error(exc.code)
+                request_evidence = observation.snapshot()
                 raise ChatSendUncertainError(
                     exc.code,
                     str(exc),
-                    observation.snapshot(),
+                    request_evidence,
+                    attempt.snapshot(request_evidence),
                 ) from None
             except Exception:
+                if attempt.click_attempted:
+                    attempt.phase = "unexpected_after_click"
+                else:
+                    attempt.phase = "unexpected_before_click"
+                request_evidence = observation.snapshot()
                 raise ChatSendUncertainError(
                     "send_pointer_result_uncertain",
                     "唯一鼠标提交后的结果无法安全确认，禁止自动重试",
-                    observation.snapshot(),
+                    request_evidence,
+                    attempt.snapshot(request_evidence),
                 ) from None
             finally:
                 self._active_send_observation = None
@@ -1006,12 +1105,16 @@ class XianyuChatClient:
                 request_evidence=request_evidence,
             )
 
-    async def _click_send_button_with_mouse(self, send_button: Locator) -> None:
+    async def _click_send_button_with_mouse(
+        self,
+        send_button: Locator,
+        attempt: _SendAttemptState,
+    ) -> None:
         """
         使用可见鼠标轨迹在发送按钮中心完成一次按下与松开。
 
         输入已通过语义和唯一性校验的按钮；无返回；按钮不可见或边界异常时失败关闭。
-        本函数不使用 JavaScript click、不伪造浏览器指纹，也不提供任何风控绕过能力。
+
         """
 
         await send_button.scroll_into_view_if_needed(timeout=5_000)
@@ -1025,14 +1128,42 @@ class XianyuChatClient:
                 "chat_send_button_geometry_invalid",
                 "聊天发送按钮没有可确认的可点击区域",
             )
-        center_x = box["x"] + box["width"] / 2
-        center_y = box["y"] + box["height"] / 2
+        attempt.phase = "checking_button"
+        click_point: tuple[float, float] | None = None
+        try:
+            for x_fraction, y_fraction in SEND_BUTTON_CLICK_FRACTIONS:
+                point_x = box["x"] + box["width"] * x_fraction
+                point_y = box["y"] + box["height"] * y_fraction
+                targets_button = await send_button.evaluate(
+                    SEND_BUTTON_HIT_TEST_SCRIPT,
+                    {"x": point_x, "y": point_y},
+                )
+                if (x_fraction, y_fraction) == (0.5, 0.5):
+                    attempt.button_center_obscured = not bool(targets_button)
+                if targets_button:
+                    click_point = (point_x, point_y)
+                    break
+        except Exception as error:
+            attempt.phase = "button_hit_test_failed"
+            raise ChatSafetyError(
+                "chat_send_button_hit_test_failed",
+                "无法确认发送按钮是否存在可安全点击区域",
+            ) from error
+        if click_point is None:
+            attempt.phase = "button_obscured"
+            raise ChatSafetyError(
+                "chat_send_button_obscured",
+                "发送按钮没有可确认的安全点击区域，已停止且未点击",
+            )
+        click_x, click_y = click_point
         await self._page.mouse.move(
-            center_x,
-            center_y,
+            click_x,
+            click_y,
             steps=SEND_POINTER_MOVE_STEPS,
         )
         await self._page.wait_for_timeout(SEND_POINTER_SETTLE_MS)
+        attempt.click_attempted = True
+        attempt.phase = "click_dispatched"
         await self._page.mouse.down()
         await self._page.wait_for_timeout(SEND_POINTER_PRESS_MS)
         await self._page.mouse.up()

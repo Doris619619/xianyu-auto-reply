@@ -46,7 +46,8 @@
 
 ### `GET /api/session/current`
 
-当前锁定会话的消息列表。
+当前锁定会话的消息列表。队列项中的 `send_diagnostic`（如存在）为脱敏发送诊断：只包含点击、
+风险检查和回显确认阶段，不包含消息正文、Cookie 或账号信息。
 
 响应额外包含 `manual_send_available`、当前会话的 `processing_reply_mode`，以及手动模式所需的本机浏览器 `browser` 状态。
 

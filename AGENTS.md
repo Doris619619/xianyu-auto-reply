@@ -23,13 +23,13 @@
 - 模块职责分离：API / 业务 / Worker / Playwright / AI / 仓储不得堆进同一文件
 - 新增源码文件顶部写中文文件头；函数与类写中文说明
 - 敏感信息（密钥、Cookie、登录态）不得写入仓库或日志
-- 发送结果不确定时禁止自动重试
 - 改动行为必须同步更新 `docs/`
 
 ## 三、运行基线
 
 - Python >= 3.11
 - `pip install -e ".[dev]"` 后执行 `playwright install chromium`
-- 先 `python scripts/login_xianyu.py` 生成登录态
+- AI 浏览器后端由 `XIANYU_BROWSER_BACKEND` 控制（`chromium` / `camoufox` / `cloakbrowser`）；后两者需 `pip install -e ".[camoufox]"` 或 `".[cloakbrowser]"`
+- 先 `python scripts/login_xianyu.py` 生成当前后端对应登录态
 - `python -m app.main` 启动 API + 面板（默认 `http://127.0.0.1:8787`）
 - 测试：`python -m pytest tests -q`

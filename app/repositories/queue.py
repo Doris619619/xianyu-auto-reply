@@ -180,6 +180,7 @@ class QueueRepository:
         *,
         summary: str | None = None,
         fail_code: str | None = None,
+        send_diagnostic: str | None = None,
     ) -> QueueItem:
         """更新队列项终态或暂挂状态。"""
 
@@ -188,6 +189,8 @@ class QueueRepository:
             item.result_summary = summary
         if fail_code is not None:
             item.fail_code = fail_code
+        if send_diagnostic is not None:
+            item.send_diagnostic = send_diagnostic
         item.waiting_since = None
         item.updated_at = datetime.now(UTC)
         self._session.commit()
@@ -244,6 +247,7 @@ class QueueRepository:
         item.position = self.next_position()
         item.result_summary = None
         item.fail_code = None
+        item.send_diagnostic = None
         item.waiting_since = None
         item.updated_at = datetime.now(UTC)
         self._session.commit()
@@ -264,6 +268,7 @@ class QueueRepository:
         item.position = self.next_position()
         item.result_summary = "恢复监听中，等待卖家新回复"
         item.fail_code = None
+        item.send_diagnostic = None
         item.waiting_since = None
         item.updated_at = datetime.now(UTC)
         self._session.commit()
@@ -292,6 +297,7 @@ class QueueRepository:
         target.position = int(min_pos) - 1
         target.result_summary = None
         target.fail_code = None
+        target.send_diagnostic = None
         target.waiting_since = None
         target.updated_at = datetime.now(UTC)
         self._session.commit()
