@@ -7,8 +7,8 @@ const statusLabel = {
   queued: "排队中",
   active: "进行中",
   parked: "暂挂",
-  done_agreed: "同意降价",
-  done_refused: "明确不降",
+  done_agreed: "已谈成",
+  done_refused: "未谈成",
   done_manual: "已手动结束",
   failed: "失败",
 };

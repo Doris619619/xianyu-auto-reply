@@ -27,10 +27,19 @@ from app.models import QueueItemStatus
 from app.repositories.queue import QueueRepository
 from app.schemas.queue import BrowserConnectionOut
 from app.seller_chat.config import load_spike_config
-from app.seller_chat.goal_outcome import seller_agreed_to_price_cut, seller_refused_price_cut
 from app.seller_chat.guardrails import scan_outbound_draft
-from app.seller_chat.llm import SellerChatDraftGenerator, SellerChatLlmError, TranscriptEntry
-from app.seller_chat.prompts import DEFAULT_GOAL, build_opening_brief, build_system_prompt
+from app.seller_chat.llm import (
+    NegotiationDecision,
+    SellerChatDraftGenerator,
+    SellerChatLlmError,
+    TranscriptEntry,
+)
+from app.seller_chat.prompts import (
+    DEFAULT_GOAL,
+    build_decision_system_prompt,
+    build_opening_brief,
+    build_system_prompt,
+)
 from app.seller_chat.session import SellerChatSession
 from app.services.xianyu_account_guard import normalize_account_guard
 
@@ -324,6 +333,7 @@ class BargainWorker:
             return
 
         system_prompt = build_system_prompt(DEFAULT_GOAL)
+        decision_system_prompt = build_decision_system_prompt(DEFAULT_GOAL)
         from app.seller_chat.item_url import ItemReference
 
         opening = build_opening_brief(
@@ -357,6 +367,7 @@ class BargainWorker:
                         item_id=item_id,
                         opened=opened,
                         system_prompt=system_prompt,
+                        decision_system_prompt=decision_system_prompt,
                         opening_brief=opening,
                         timeout_seconds=timeout_seconds,
                         max_rounds=max_rounds,
@@ -402,6 +413,7 @@ class BargainWorker:
         item_id: int,
         opened: OpenedXianyuChat,
         system_prompt: str,
+        decision_system_prompt: str,
         opening_brief: str,
         timeout_seconds: float,
         max_rounds: int,
@@ -420,6 +432,7 @@ class BargainWorker:
             generator=self.draft_generator,
             system_prompt=system_prompt,
             opening_brief=opening_brief,
+            decision_system_prompt=decision_system_prompt,
             sleep=self.sleep,
         )
         await session_obj.start()
@@ -440,7 +453,14 @@ class BargainWorker:
         if already_sent_rounds > 0:
             if pending_seller:
                 self._persist_transcript(item_id, session_obj, skip_first=skip_first)
-                if self._finish_if_outcome(item_id, pending_seller):
+                if (
+                    await self._respond_to_seller(
+                        item_id=item_id,
+                        session_obj=session_obj,
+                        skip_first=skip_first,
+                    )
+                    != "continue"
+                ):
                     return
             else:
                 self._set_waiting_summary(item_id, "续跑中：等待卖家新回复…")
@@ -460,7 +480,14 @@ class BargainWorker:
                             )
                     return
                 self._persist_transcript(item_id, session_obj, skip_first=skip_first)
-                if self._finish_if_outcome(item_id, reply.texts):
+                if (
+                    await self._respond_to_seller(
+                        item_id=item_id,
+                        session_obj=session_obj,
+                        skip_first=skip_first,
+                    )
+                    != "continue"
+                ):
                     return
             await self._deep_chat_loop(
                 item_id=item_id,
@@ -473,7 +500,17 @@ class BargainWorker:
 
         # 新任务：先发议价，再等卖家。
         send_result = await self._send_one_round(item_id, session_obj, skip_first=skip_first)
-        if send_result != "continue":
+        if send_result == "seller_reply":
+            if (
+                await self._respond_to_seller(
+                    item_id=item_id,
+                    session_obj=session_obj,
+                    skip_first=skip_first,
+                )
+                != "continue"
+            ):
+                return
+        elif send_result != "continue":
             return
 
         self._set_waiting_summary(item_id, "已发送，正在等待卖家新回复…")
@@ -496,7 +533,14 @@ class BargainWorker:
             return
         else:
             self._persist_transcript(item_id, session_obj, skip_first=skip_first)
-            if self._finish_if_outcome(item_id, reply.texts):
+            if (
+                await self._respond_to_seller(
+                    item_id=item_id,
+                    session_obj=session_obj,
+                    skip_first=skip_first,
+                )
+                != "continue"
+            ):
                 return
 
         await self._deep_chat_loop(
@@ -609,11 +653,6 @@ class BargainWorker:
                         )
                 return
 
-            send_result = await self._send_one_round(
-                item_id, session_obj, skip_first=skip_first
-            )
-            if send_result != "continue":
-                return
             self._set_waiting_summary(item_id, "深聊中，正在等待卖家新回复…")
             reply = await self._wait_with_abort(item_id, session_obj, timeout_seconds)
             if self._should_abort(item_id):
@@ -621,7 +660,14 @@ class BargainWorker:
             if reply is None:
                 continue
             self._persist_transcript(item_id, session_obj, skip_first=skip_first)
-            if self._finish_if_outcome(item_id, reply.texts):
+            if (
+                await self._respond_to_seller(
+                    item_id=item_id,
+                    session_obj=session_obj,
+                    skip_first=skip_first,
+                )
+                != "continue"
+            ):
                 return
 
     async def _send_one_round(
@@ -649,7 +695,64 @@ class BargainWorker:
                 summary=f"草稿命中黑名单：{codes}",
             )
             return "failed"
-        outcome = await session_obj.send(proposal.text)
+        return await self._send_draft(
+            item_id=item_id,
+            session_obj=session_obj,
+            text=proposal.text,
+            skip_first=skip_first,
+        )
+
+    async def _respond_to_seller(
+        self,
+        *,
+        item_id: int,
+        session_obj: SellerChatSession,
+        skip_first: int,
+    ) -> str:
+        """
+        根据完整会话执行一次 AI 结构化裁决，并发送唯一允许的继续消息。
+
+        agreed / refused 只写终态信号、不再发送；continue 的消息仍需通过硬性安全扫描。
+        如果发送后已同步到新的卖家消息，会立即按该新消息再裁决，避免丢失快速回复。
+        """
+
+        while True:
+            if self._should_abort(item_id):
+                return "done"
+            proposal = await session_obj.next_decision()
+            decision = proposal.decision
+            if decision.action != "continue":
+                self._finish_from_decision(item_id, decision)
+                return "done"
+            if proposal.findings:
+                codes = ",".join(f.code for f in proposal.findings)
+                self._fail_item(
+                    item_id,
+                    code="decision_draft_blocked",
+                    summary=f"AI 继续消息命中安全规则：{codes}",
+                )
+                return "failed"
+            assert decision.message is not None
+            send_result = await self._send_draft(
+                item_id=item_id,
+                session_obj=session_obj,
+                text=decision.message,
+                skip_first=skip_first,
+            )
+            if send_result != "seller_reply":
+                return send_result
+
+    async def _send_draft(
+        self,
+        *,
+        item_id: int,
+        session_obj: SellerChatSession,
+        text: str,
+        skip_first: int,
+    ) -> str:
+        """发送已通过安全扫描的单条草稿，并返回是否已同步到卖家快速回复。"""
+
+        outcome = await session_obj.send(text)
         with self.session_factory() as session:
             repo = QueueRepository(session)
             item = repo.get_item(item_id)
@@ -657,9 +760,7 @@ class BargainWorker:
                 repo.bump_rounds(item)
                 repo.mark_waiting(item)
         self._persist_transcript(item_id, session_obj, skip_first=skip_first)
-        if outcome.seller_texts and self._finish_if_outcome(item_id, outcome.seller_texts):
-            return "done"
-        return "continue"
+        return "seller_reply" if outcome.seller_texts else "continue"
 
     async def _wait_with_abort(
         self,
@@ -691,36 +792,45 @@ class BargainWorker:
             waited += chunk
         return None
 
-    def _finish_if_outcome(self, item_id: int, texts: tuple[str, ...]) -> bool:
-        """
-        若卖家同意或拒绝降价则写终态并返回 True。
-        """
+    def _finish_from_decision(self, item_id: int, decision: NegotiationDecision) -> None:
+        """将 AI 的终态裁决写入兼容的队列结束信号，不记录卖家原文。"""
 
-        if seller_refused_price_cut(texts):
-            with self.session_factory() as session:
-                repo = QueueRepository(session)
-                item = repo.get_item(item_id)
-                if item is not None and item.status == QueueItemStatus.ACTIVE:
-                    repo.mark_status(
-                        item,
-                        QueueItemStatus.DONE_REFUSED,
-                        summary="卖家明确不降价",
-                        fail_code="refused",
-                    )
-            return True
-        if seller_agreed_to_price_cut(texts):
-            with self.session_factory() as session:
-                repo = QueueRepository(session)
-                item = repo.get_item(item_id)
-                if item is not None and item.status == QueueItemStatus.ACTIVE:
-                    repo.mark_status(
-                        item,
-                        QueueItemStatus.DONE_AGREED,
-                        summary="卖家同意降价",
-                        fail_code="agreed",
-                    )
-            return True
-        return False
+        if decision.action == "agreed":
+            status = QueueItemStatus.DONE_AGREED
+            fail_code = "ai_agreed"
+            summary = (
+                "AI 判定：卖家明确降价"
+                if decision.reason_code == "price_cut"
+                else "AI 判定：卖家提供明确让利"
+            )
+        else:
+            status = QueueItemStatus.DONE_REFUSED
+            fail_code = "ai_refused"
+            summary = "AI 判定：没有可继续协商的空间"
+        with self.session_factory() as session:
+            repo = QueueRepository(session)
+            item = repo.get_item(item_id)
+            if item is not None and item.status == QueueItemStatus.ACTIVE:
+                repo.mark_status(
+                    item,
+                    status,
+                    summary=summary,
+                    fail_code=fail_code,
+                )
+
+    def _park_for_timeout(self, item_id: int) -> None:
+        """将首轮或续跑等待超时的 active 项暂挂，避免自动催发。"""
+
+        with self.session_factory() as session:
+            repo = QueueRepository(session)
+            item = repo.get_item(item_id)
+            if item is not None and item.status == QueueItemStatus.ACTIVE:
+                repo.mark_status(
+                    item,
+                    QueueItemStatus.PARKED,
+                    summary="等待卖家超时，已暂挂",
+                    fail_code="seller_timeout",
+                )
 
     def _set_waiting_summary(self, item_id: int, summary: str) -> None:
         """更新进行中项的等待说明，供面板展示。"""

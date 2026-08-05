@@ -13,19 +13,28 @@
 也不记录密钥、提示词或卖家原文。
 """
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Self
 
 import httpx
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
-from app.ai.base import ProcurementAiOutputError
+from app.ai.base import AiOutputError, ProcurementAiOutputError
 from app.ai.deepseek import DeepSeekConfig, _extract_completed_content
 from app.seller_chat.prompts import FOLLOW_UP_NUDGE
 
 MAX_DRAFT_CHARACTERS = 500
 
 Speaker = Literal["me", "seller"]
+NegotiationAction = Literal["continue", "agreed", "refused"]
+NegotiationReasonCode = Literal[
+    "price_cut",
+    "other_concession",
+    "no_concession",
+    "uncertain",
+]
 
 
 class SellerChatLlmError(RuntimeError):
@@ -74,6 +83,49 @@ class LlmOutputError(SellerChatLlmError):
 
     code = "llm_output_invalid"
     safe_message = "DeepSeek 返回的内容不完整或为空"
+
+
+class LlmDecisionOutputError(LlmOutputError):
+    """表示模型未按约定返回可安全执行的结构化议价裁决。"""
+
+    code = "llm_decision_output_invalid"
+    safe_message = "DeepSeek 返回的议价裁决格式不可用"
+
+
+class NegotiationDecision(BaseModel):
+    """
+    表示模型对一轮卖家回复的唯一可执行裁决。
+
+    终态不携带外发文本；只有 continue 可以给出下一条消息。该模型只校验结构，
+    发送前仍必须经过既有硬性安全规则和页面确认。
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+
+    action: NegotiationAction
+    reason_code: NegotiationReasonCode
+    message: str | None = None
+
+    @model_validator(mode="after")
+    def validate_action_contract(self) -> Self:
+        """校验 action、原因码与消息字段的固定组合。"""
+
+        if self.action == "continue":
+            if self.reason_code != "uncertain" or not self.message:
+                raise ValueError("continue 必须携带 uncertain 原因和非空 message")
+            if len(self.message) > 200:
+                raise ValueError("continue 的 message 超过 200 字")
+            return self
+        if self.message is not None:
+            raise ValueError("终态裁决不得携带 message")
+        if self.action == "agreed" and self.reason_code in {
+            "price_cut",
+            "other_concession",
+        }:
+            return self
+        if self.action == "refused" and self.reason_code == "no_concession":
+            return self
+        raise ValueError("终态裁决的 action 与 reason_code 不匹配")
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +247,35 @@ class SellerChatDraftGenerator:
         response = self._request_completion(payload)
         return self._parse_draft(response)
 
+    def decide(
+        self,
+        *,
+        system_prompt: str,
+        opening_brief: str,
+        transcript: Sequence[TranscriptEntry],
+    ) -> NegotiationDecision:
+        """
+        基于完整对话返回继续、谈成或未谈成的结构化裁决。
+
+        输入为只读提示词和聊天记录；返回经 Pydantic 校验的固定决策。
+        格式错误、超时或传输失败抛出 SellerChatLlmError，调用方必须失败关闭且不得发送。
+        """
+
+        payload: dict[str, Any] = {
+            "model": self._config.model,
+            "messages": build_chat_messages(
+                system_prompt=system_prompt,
+                opening_brief=opening_brief,
+                transcript=transcript,
+            ),
+            "temperature": self._config.temperature,
+            "max_tokens": self._config.max_tokens,
+            "stream": False,
+            "thinking": {"type": "disabled"},
+        }
+        response = self._request_completion(payload)
+        return self._parse_decision(response)
+
     def close(self) -> None:
         """
         关闭由本实例创建的 HTTP Client，保留调用方注入 Client 的所有权。
@@ -281,3 +362,19 @@ class SellerChatDraftGenerator:
         if not draft or len(draft) > MAX_DRAFT_CHARACTERS:
             raise LlmOutputError
         return draft
+
+    def _parse_decision(self, response: httpx.Response) -> NegotiationDecision:
+        """从完成响应中解析并严格校验结构化议价裁决。"""
+
+        try:
+            content = _extract_completed_content(response.json())
+            parsed = json.loads(content)
+            return NegotiationDecision.model_validate(parsed)
+        except (
+            AiOutputError,
+            UnicodeDecodeError,
+            ValidationError,
+            ValueError,
+            TypeError,
+        ):
+            raise LlmDecisionOutputError from None

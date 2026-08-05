@@ -28,7 +28,11 @@ from app.seller_chat.guardrails import (
     scan_inbound_message,
     scan_outbound_draft,
 )
-from app.seller_chat.llm import SellerChatDraftGenerator, TranscriptEntry
+from app.seller_chat.llm import (
+    NegotiationDecision,
+    SellerChatDraftGenerator,
+    TranscriptEntry,
+)
 
 # 等卖家回复的退避节奏：先密后疏，只读聊天 DOM，不执行整页刷新。
 SELLER_REPLY_POLL_BACKOFF_SECONDS: tuple[float, ...] = (2.0, 3.0, 5.0, 8.0, 12.0, 15.0)
@@ -45,6 +49,19 @@ class DraftProposal:
     """
 
     text: str
+    findings: tuple[GuardrailFinding, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionProposal:
+    """
+    表示模型结构化裁决及其 continue 消息的安全扫描结果。
+
+    agreed / refused 裁决不包含外发文本，因此 findings 必须为空；continue 的 message
+    在 Worker 真正发送前仍需沿用既有确定性黑名单校验。
+    """
+
+    decision: NegotiationDecision
     findings: tuple[GuardrailFinding, ...]
 
 
@@ -99,6 +116,7 @@ class SellerChatSession:
         generator: SellerChatDraftGenerator,
         system_prompt: str,
         opening_brief: str,
+        decision_system_prompt: str | None = None,
         sleep: SLEEP_CALLABLE | None = None,
     ) -> None:
         """
@@ -111,6 +129,7 @@ class SellerChatSession:
         self._client = client
         self._generator = generator
         self._system_prompt = system_prompt
+        self._decision_system_prompt = decision_system_prompt or system_prompt
         self._opening_brief = opening_brief
         self._sleep: SLEEP_CALLABLE = sleep if sleep is not None else _default_sleep
         self._transcript: list[TranscriptEntry] = []
@@ -171,6 +190,27 @@ class SellerChatSession:
         )
         draft = text.strip()
         return DraftProposal(text=draft, findings=scan_outbound_draft(draft))
+
+    async def next_decision(self) -> DecisionProposal:
+        """
+        基于完整聊天记录请求本轮继续或结束的结构化议价裁决。
+
+        返回 agreed / refused 时不会包含外发消息；返回 continue 时会扫描模型给出的唯一
+        后续消息。模型输出异常向上抛出，调用方必须失败关闭而不能回退关键词规则。
+        """
+
+        decision = await asyncio.to_thread(
+            self._generator.decide,
+            system_prompt=self._decision_system_prompt,
+            opening_brief=self._opening_brief,
+            transcript=self.transcript,
+        )
+        findings = (
+            scan_outbound_draft(decision.message)
+            if decision.action == "continue" and decision.message is not None
+            else ()
+        )
+        return DecisionProposal(decision=decision, findings=findings)
 
     async def send(self, text: str) -> SendOutcome:
         """

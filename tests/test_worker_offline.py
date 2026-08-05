@@ -31,7 +31,11 @@ from app.crawler.chat_client import (
 from app.crawler.chat_runtime import OpenedXianyuChat
 from app.models import QueueItemStatus, init_db
 from app.repositories.queue import QueueRepository
-from app.seller_chat.llm import SellerChatDraftGenerator
+from app.seller_chat.llm import (
+    LlmDecisionOutputError,
+    NegotiationDecision,
+    SellerChatDraftGenerator,
+)
 from app.seller_chat.session import empty_conversation_fingerprint
 from app.services.queue_service import QueueService
 from app.worker.bargain_worker import BargainWorker
@@ -239,15 +243,41 @@ class ConfirmedButRescanEmptyFakeChatClient(FakeChatClient):
 
 
 class FixedDraftGenerator(SellerChatDraftGenerator):
-    """返回固定短句，避免真实 HTTP。"""
+    """返回固定草稿和预设结构化裁决，避免真实 HTTP。"""
 
-    def __init__(self, text: str = "老板能便宜一点吗") -> None:
+    def __init__(
+        self,
+        text: str = "老板能便宜一点吗",
+        decisions: list[NegotiationDecision] | None = None,
+    ) -> None:
         super().__init__(DeepSeekConfig(api_key=SecretStr("x" * 32)))
         self._text = text
+        self._decisions = list(
+            decisions
+            or [
+                NegotiationDecision(
+                    action="agreed",
+                    reason_code="price_cut",
+                    message=None,
+                )
+            ]
+        )
 
     def generate(self, **kwargs: Any) -> str:  # type: ignore[override]
         del kwargs
         return self._text
+
+    def decide(self, **kwargs: Any) -> NegotiationDecision:  # type: ignore[override]
+        del kwargs
+        return self._decisions.pop(0)
+
+
+class InvalidDecisionGenerator(FixedDraftGenerator):
+    """模拟模型返回无法安全解析的结构化裁决。"""
+
+    def decide(self, **kwargs: Any) -> NegotiationDecision:  # type: ignore[override]
+        del kwargs
+        raise LlmDecisionOutputError
 
 
 @pytest.fixture()
@@ -314,6 +344,161 @@ async def test_worker_timeout_parks_then_next(session_factory: sessionmaker) -> 
         assert row is not None
         assert row.status == QueueItemStatus.DONE_AGREED
     await worker.chat_factory.stop()
+
+
+@pytest.mark.asyncio
+async def test_ai_marks_free_shipping_concession_as_agreed_without_extra_message(
+    session_factory: sessionmaker,
+) -> None:
+    """卖家明确包邮时，AI 应返回谈成信号且不再发送感谢或告别。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("1010")
+    client = FakeChatClient(
+        inbound_script=[[_snapshot("seller", "价格不变，但可以包邮", "m-free-ship")]]
+    )
+    worker = BargainWorker(
+        session_factory=session_factory,
+        chat_factory=FakeFactory({"1010": client}),
+        draft_generator=FixedDraftGenerator(
+            decisions=[
+                NegotiationDecision(
+                    action="agreed",
+                    reason_code="other_concession",
+                    message=None,
+                )
+            ]
+        ),
+        expected_account_id=ACCOUNT,
+    )
+
+    item_id = worker._claim_next_id()
+    assert item_id == item.id
+    await worker._process_item(item_id)
+
+    with session_factory() as session:
+        row = QueueRepository(session).get_item(item.id)
+        assert row is not None
+        assert row.status == QueueItemStatus.DONE_AGREED
+        assert row.result_summary == "AI 判定：卖家提供明确让利"
+        assert row.fail_code == "ai_agreed"
+    assert client.sent == ["老板能便宜一点吗"]
+
+
+@pytest.mark.asyncio
+async def test_ai_continue_sends_one_follow_up_then_can_end_refused(
+    session_factory: sessionmaker,
+) -> None:
+    """含糊回复只触发一条继续消息；下一条明确拒绝由 AI 结束任务。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("1011")
+    client = FakeChatClient(
+        inbound_script=[
+            [_snapshot("seller", "你能接受多少？", "m-uncertain")],
+            [_snapshot("seller", "这个确实没法再让了", "m-refused")],
+        ]
+    )
+    worker = BargainWorker(
+        session_factory=session_factory,
+        chat_factory=FakeFactory({"1011": client}),
+        draft_generator=FixedDraftGenerator(
+            decisions=[
+                NegotiationDecision(
+                    action="continue",
+                    reason_code="uncertain",
+                    message="如果包邮的话可以吗？",
+                ),
+                NegotiationDecision(
+                    action="refused",
+                    reason_code="no_concession",
+                    message=None,
+                ),
+            ]
+        ),
+        expected_account_id=ACCOUNT,
+    )
+
+    item_id = worker._claim_next_id()
+    assert item_id == item.id
+    await worker._process_item(item_id)
+
+    with session_factory() as session:
+        row = QueueRepository(session).get_item(item.id)
+        assert row is not None
+        assert row.status == QueueItemStatus.DONE_REFUSED
+        assert row.result_summary == "AI 判定：没有可继续协商的空间"
+        assert row.fail_code == "ai_refused"
+        assert row.rounds_sent == 2
+    assert client.sent == ["老板能便宜一点吗", "如果包邮的话可以吗？"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_ai_decision_fails_closed_without_sending_follow_up(
+    session_factory: sessionmaker,
+) -> None:
+    """裁决 JSON 不可用时，只保留已确认的首轮消息，不得追加自动回复。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("1012")
+    client = FakeChatClient(
+        inbound_script=[[_snapshot("seller", "能少一点吗？", "m-invalid-decision")]]
+    )
+    worker = BargainWorker(
+        session_factory=session_factory,
+        chat_factory=FakeFactory({"1012": client}),
+        draft_generator=InvalidDecisionGenerator(),
+        expected_account_id=ACCOUNT,
+    )
+
+    item_id = worker._claim_next_id()
+    assert item_id == item.id
+    await worker._process_item(item_id)
+
+    with session_factory() as session:
+        row = QueueRepository(session).get_item(item.id)
+        assert row is not None
+        assert row.status == QueueItemStatus.FAILED
+        assert row.fail_code == "llm_decision_output_invalid"
+    assert client.sent == ["老板能便宜一点吗"]
+
+
+@pytest.mark.asyncio
+async def test_unsafe_ai_continue_message_fails_closed_without_sending_it(
+    session_factory: sessionmaker,
+) -> None:
+    """继续裁决携带站外内容时，硬性规则必须阻止第二条消息发出。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("1013")
+    client = FakeChatClient(
+        inbound_script=[[_snapshot("seller", "你能出多少？", "m-unsafe-follow-up")]]
+    )
+    worker = BargainWorker(
+        session_factory=session_factory,
+        chat_factory=FakeFactory({"1013": client}),
+        draft_generator=FixedDraftGenerator(
+            decisions=[
+                NegotiationDecision(
+                    action="continue",
+                    reason_code="uncertain",
+                    message="加我微信再聊",
+                )
+            ]
+        ),
+        expected_account_id=ACCOUNT,
+    )
+
+    item_id = worker._claim_next_id()
+    assert item_id == item.id
+    await worker._process_item(item_id)
+
+    with session_factory() as session:
+        row = QueueRepository(session).get_item(item.id)
+        assert row is not None
+        assert row.status == QueueItemStatus.FAILED
+        assert row.fail_code == "decision_draft_blocked"
+    assert client.sent == ["老板能便宜一点吗"]
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,6 @@ from sqlalchemy.orm import sessionmaker
 
 from app.models import QueueItemStatus, init_db
 from app.repositories.queue import QueueRepository
-from app.seller_chat.goal_outcome import seller_agreed_to_price_cut, seller_refused_price_cut
 from app.seller_chat.guardrails import scan_outbound_draft
 from app.seller_chat.item_url import ItemUrlError, parse_item_reference
 from app.services.queue_service import QueueService, QueueServiceError
@@ -61,14 +60,6 @@ def test_parse_rejects_non_goofish() -> None:
 
     with pytest.raises(ItemUrlError):
         parse_item_reference("https://example.com/item?id=1")
-
-
-def test_agree_and_refuse_detection() -> None:
-    """同意与拒绝降价的确定性判定。"""
-
-    assert seller_agreed_to_price_cut(["可以便宜一点"])
-    assert seller_refused_price_cut(["不能再便宜了，一口价"])
-    assert not seller_agreed_to_price_cut(["不能再便宜了，一口价"])
 
 
 def test_outbound_allows_negotiation_blocks_payment() -> None:
