@@ -14,6 +14,7 @@
 """
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Self
@@ -26,6 +27,12 @@ from app.ai.deepseek import DeepSeekConfig, _extract_completed_content
 from app.seller_chat.prompts import FOLLOW_UP_NUDGE
 
 MAX_DRAFT_CHARACTERS = 500
+
+# 只兼容整个回答被 Markdown 代码块包裹的 JSON，不能容忍前后夹带解释文字。
+_COMPLETE_JSON_CODE_FENCE = re.compile(
+    r"\A```(?:json)?[ \t]*\r?\n(?P<content>.*?)\r?\n?```\Z",
+    re.IGNORECASE | re.DOTALL,
+)
 
 Speaker = Literal["me", "seller"]
 NegotiationAction = Literal["continue", "agreed", "refused"]
@@ -272,6 +279,7 @@ class SellerChatDraftGenerator:
             "max_tokens": self._config.max_tokens,
             "stream": False,
             "thinking": {"type": "disabled"},
+            "response_format": {"type": "json_object"},
         }
         response = self._request_completion(payload)
         return self._parse_decision(response)
@@ -368,7 +376,7 @@ class SellerChatDraftGenerator:
 
         try:
             content = _extract_completed_content(response.json())
-            parsed = json.loads(content)
+            parsed = json.loads(_unwrap_complete_json_code_fence(content))
             return NegotiationDecision.model_validate(parsed)
         except (
             AiOutputError,
@@ -378,3 +386,18 @@ class SellerChatDraftGenerator:
             TypeError,
         ):
             raise LlmDecisionOutputError from None
+
+
+def _unwrap_complete_json_code_fence(content: str) -> str:
+    """
+    仅移除完整包裹响应的 JSON Markdown 代码块。
+
+    参数为模型已完成的非空正文；若正文不是完整代码块则原样去首尾空白返回，
+    因此任何前后解释文字仍会在 JSON 解析阶段失败关闭。函数不记录模型原文。
+    """
+
+    normalized = content.strip()
+    match = _COMPLETE_JSON_CODE_FENCE.fullmatch(normalized)
+    if match is None:
+        return normalized
+    return match.group("content").strip()
