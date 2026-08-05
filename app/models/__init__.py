@@ -43,6 +43,8 @@ class QueueItem(Base):
     item_id: Mapped[str] = mapped_column(String(64), index=True)
     detail_url: Mapped[str] = mapped_column(String(512))
     title: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    list_price_yuan: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    price_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status: Mapped[str] = mapped_column(String(32), index=True, default=QueueItemStatus.QUEUED)
     position: Mapped[int] = mapped_column(Integer, index=True, default=0)
     seller_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -133,6 +135,14 @@ def _upgrade_sqlite_schema(engine, database_url: str) -> None:
             )
         if "send_diagnostic" not in item_columns:
             connection.exec_driver_sql("ALTER TABLE queue_items ADD COLUMN send_diagnostic TEXT")
+        if "list_price_yuan" not in item_columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE queue_items ADD COLUMN list_price_yuan VARCHAR(32)"
+            )
+        if "price_source" not in item_columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE queue_items ADD COLUMN price_source VARCHAR(32)"
+            )
 
 
 def get_session_factory() -> sessionmaker:

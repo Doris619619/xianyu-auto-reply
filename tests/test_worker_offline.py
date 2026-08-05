@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ from app.crawler.chat_client import (
     build_message_fingerprint,
 )
 from app.crawler.chat_runtime import OpenedXianyuChat
+from app.crawler.product_context import ProductContext
 from app.models import QueueItemStatus, init_db
 from app.repositories.queue import QueueRepository
 from app.seller_chat.llm import (
@@ -133,8 +135,13 @@ class FakeChatClient:
 class FakeFactory:
     """按商品 ID 返回预设 Fake 客户端。"""
 
-    def __init__(self, clients: dict[str, FakeChatClient]) -> None:
+    def __init__(
+        self,
+        clients: dict[str, FakeChatClient],
+        products: dict[str, ProductContext] | None = None,
+    ) -> None:
         self.clients = clients
+        self.products = products or {}
 
     async def start(self) -> None:
         return None
@@ -151,7 +158,11 @@ class FakeFactory:
             seller_id="seller1",
             account_id=ACCOUNT,
         )
-        yield OpenedXianyuChat(binding=binding, client=client)
+        yield OpenedXianyuChat(
+            binding=binding,
+            client=client,
+            product=self.products.get(item_id, ProductContext()),
+        )
 
 
 class UnconfirmedFakeChatClient(FakeChatClient):
@@ -277,7 +288,23 @@ class InvalidDecisionGenerator(FixedDraftGenerator):
 
     def decide(self, **kwargs: Any) -> NegotiationDecision:  # type: ignore[override]
         del kwargs
-        raise LlmDecisionOutputError
+        raise LlmDecisionOutputError("decision_json_invalid")
+
+
+class ExhaustedDecisionGenerator(FixedDraftGenerator):
+    """模拟两次无副作用裁决均不可用后的可恢复暂挂。"""
+
+    def decide(self, **kwargs: Any) -> NegotiationDecision:  # type: ignore[override]
+        del kwargs
+        raise LlmDecisionOutputError("decision_retry_exhausted_completion_envelope_invalid")
+
+
+class DecisionMustNotRunGenerator(FixedDraftGenerator):
+    """确保卖家明确要价时不调用 DeepSeek 裁决。"""
+
+    def decide(self, **kwargs: Any) -> NegotiationDecision:  # type: ignore[override]
+        del kwargs
+        raise AssertionError("明确要价不应调用模型裁决")
 
 
 @pytest.fixture()
@@ -460,7 +487,128 @@ async def test_invalid_ai_decision_fails_closed_without_sending_follow_up(
         assert row is not None
         assert row.status == QueueItemStatus.FAILED
         assert row.fail_code == "llm_decision_output_invalid"
+        assert row.result_summary == (
+            "DeepSeek 返回的议价裁决格式不可用（诊断：decision_json_invalid）"
+        )
     assert client.sent == ["老板能便宜一点吗"]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_decision_retry_parks_without_sending_follow_up(
+    session_factory: sessionmaker,
+) -> None:
+    """两次裁决都不可用时，应暂挂给用户重新裁决且不追加消息。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("10120")
+    client = FakeChatClient(
+        inbound_script=[[_snapshot("seller", "能少一点吗？", "m-retry-exhausted")]]
+    )
+    worker = BargainWorker(
+        session_factory=session_factory,
+        chat_factory=FakeFactory({"10120": client}),
+        draft_generator=ExhaustedDecisionGenerator(),
+        expected_account_id=ACCOUNT,
+    )
+
+    item_id = worker._claim_next_id()
+    assert item_id == item.id
+    await worker._process_item(item_id)
+
+    with session_factory() as session:
+        row = QueueRepository(session).get_item(item.id)
+        assert row is not None
+        assert row.status == QueueItemStatus.PARKED
+        assert row.fail_code == "decision_retry_exhausted_completion_envelope_invalid"
+        assert row.result_summary == "AI 暂不可用，未发送消息；可重新裁决（不重发）"
+    assert client.sent == ["老板能便宜一点吗"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_price_request_uses_default_offer_without_calling_llm(
+    session_factory: sessionmaker,
+) -> None:
+    """卖家明确问价后，Worker 直接发送 85% 的受控报价而不调用模型。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("10121")
+    client = FakeChatClient(
+        inbound_script=[[_snapshot("seller", "你能出多少？", "m-offer")]]
+    )
+    worker = BargainWorker(
+        session_factory=session_factory,
+        chat_factory=FakeFactory(
+            {"10121": client},
+            {"10121": ProductContext(list_price=Decimal("1000"), source="structured")},
+        ),
+        draft_generator=DecisionMustNotRunGenerator(),
+        expected_account_id=ACCOUNT,
+    )
+
+    item_id = worker._claim_next_id()
+    assert item_id == item.id
+    await worker._process_item(item_id)
+
+    assert client.sent == ["老板能便宜一点吗", "我这边预算能到 850 元，您看方便吗？"]
+
+
+@pytest.mark.asyncio
+async def test_seller_phrase_give_me_a_price_uses_default_offer(
+    session_factory: sessionmaker,
+) -> None:
+    """“你给我个价格”也属于明确要价，不能再漏进 AI 追问路径。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("10123")
+    client = FakeChatClient(
+        inbound_script=[[_snapshot("seller", "你给我个价格", "m-give-me-price")]]
+    )
+    worker = BargainWorker(
+        session_factory=session_factory,
+        chat_factory=FakeFactory(
+            {"10123": client},
+            {"10123": ProductContext(list_price=Decimal("86"), source="visible")},
+        ),
+        draft_generator=DecisionMustNotRunGenerator(),
+        expected_account_id=ACCOUNT,
+    )
+
+    item_id = worker._claim_next_id()
+    assert item_id == item.id
+    await worker._process_item(item_id)
+
+    assert client.sent == ["老板能便宜一点吗", "我这边预算能到 73 元，您看方便吗？"]
+
+
+@pytest.mark.asyncio
+async def test_price_request_without_reliable_price_asks_for_discount_without_llm(
+    session_factory: sessionmaker,
+) -> None:
+    """缺少可靠标价时不猜金额，改问卖家最多能优惠多少。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("10122")
+    client = FakeChatClient(
+        inbound_script=[[_snapshot("seller", "你能出多少？", "m-unknown-price")]]
+    )
+    worker = BargainWorker(
+        session_factory=session_factory,
+        chat_factory=FakeFactory({"10122": client}),
+        draft_generator=DecisionMustNotRunGenerator(),
+        expected_account_id=ACCOUNT,
+    )
+
+    item_id = worker._claim_next_id()
+    assert item_id == item.id
+    await worker._process_item(item_id)
+
+    with session_factory() as session:
+        row = QueueRepository(session).get_item(item.id)
+        assert row is not None
+        assert row.status == QueueItemStatus.PARKED
+        assert row.fail_code == "seller_timeout"
+        assert row.result_summary == "等待卖家超时，已暂挂"
+    assert client.sent == ["老板能便宜一点吗", "老板您看最多能优惠多少钱？"]
 
 
 @pytest.mark.asyncio
@@ -472,7 +620,7 @@ async def test_unsafe_ai_continue_message_fails_closed_without_sending_it(
     service = QueueService(session_factory)
     item = service.enqueue("1013")
     client = FakeChatClient(
-        inbound_script=[[_snapshot("seller", "你能出多少？", "m-unsafe-follow-up")]]
+        inbound_script=[[_snapshot("seller", "还能再优惠一点吗？", "m-unsafe-follow-up")]]
     )
     worker = BargainWorker(
         session_factory=session_factory,

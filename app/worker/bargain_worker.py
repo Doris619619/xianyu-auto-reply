@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -23,6 +24,7 @@ from app.crawler.chat_client import (
     SendAttemptDiagnostic,
 )
 from app.crawler.chat_runtime import OpenedXianyuChat
+from app.crawler.product_context import ProductContext
 from app.models import QueueItemStatus
 from app.repositories.queue import QueueRepository
 from app.schemas.queue import BrowserConnectionOut
@@ -44,8 +46,16 @@ from app.seller_chat.session import SellerChatSession
 from app.services.xianyu_account_guard import normalize_account_guard
 
 logger = logging.getLogger(__name__)
+decision_diagnostic_logger = logging.getLogger("app.decision_diagnostic")
 
 SLEEP_CALLABLE = Callable[[float], Awaitable[None]]
+UNKNOWN_PRICE_FOLLOW_UP = "老板您看最多能优惠多少钱？"
+_SELLER_ASKS_BUYER_PRICE = re.compile(
+    r"(?:出多少|能出多少|多少能出|预算多少|给(?:我)?个价(?:格)?|开(?:个)?价|"
+    r"你说(?:个)?价|你报(?:个)?价|多少钱要|最低能给多少)",
+    re.IGNORECASE,
+)
+DEFAULT_OFFER_PERCENT = 85
 
 
 def _send_uncertain_summary(code: str) -> str:
@@ -85,6 +95,15 @@ def _seller_texts_after_last_me(
             pending.append(entry.text)
     pending.reverse()
     return tuple(pending)
+
+
+def _seller_explicitly_asks_buyer_price(
+    transcript: tuple[TranscriptEntry, ...] | list[TranscriptEntry],
+) -> bool:
+    """只在最近一组卖家消息明确要求买方报价时允许外发固定金额话术。"""
+
+    seller_texts = _seller_texts_after_last_me(transcript)
+    return bool(seller_texts and _SELLER_ASKS_BUYER_PRICE.search("\n".join(seller_texts)))
 
 
 class ChatOpenFactory(Protocol):
@@ -336,11 +355,6 @@ class BargainWorker:
         decision_system_prompt = build_decision_system_prompt(DEFAULT_GOAL)
         from app.seller_chat.item_url import ItemReference
 
-        opening = build_opening_brief(
-            ItemReference(item_id=source_item_id, detail_url=detail_url),
-            title,
-        )
-
         factory = self.manual_chat_factory if reply_mode == "manual" else self.chat_factory
         assert factory is not None
 
@@ -363,6 +377,11 @@ class BargainWorker:
                 if reply_mode == "manual":
                     await self._run_manual_session(item_id=item_id, opened=opened)
                 else:
+                    opening = build_opening_brief(
+                        ItemReference(item_id=source_item_id, detail_url=detail_url),
+                        title,
+                        opened.product,
+                    )
                     await self._run_session(
                         item_id=item_id,
                         opened=opened,
@@ -397,10 +416,31 @@ class BargainWorker:
                 summary=f"聊天安全失败[{code}]：{error}",
             )
         except SellerChatLlmError as error:
+            diagnostic_code = getattr(error, "diagnostic_code", None)
+            if diagnostic_code is not None:
+                decision_diagnostic_logger.warning(
+                    "queue_item_id=%s llm_code=%s diagnostic=%s",
+                    item_id,
+                    error.code,
+                    diagnostic_code,
+                )
+            if diagnostic_code is not None and diagnostic_code.startswith(
+                "decision_retry_exhausted_"
+            ):
+                self._park_for_ai_unavailable(
+                    item_id,
+                    "AI 暂不可用，未发送消息；可重新裁决（不重发）",
+                    diagnostic_code,
+                )
+                return
             self._fail_item(
                 item_id,
                 code=getattr(error, "code", "llm_error"),
-                summary=str(error) or "生成议价草稿失败",
+                summary=(
+                    f"{str(error)}（诊断：{diagnostic_code}）"
+                    if diagnostic_code is not None
+                    else (str(error) or "生成议价草稿失败")
+                ),
             )
         finally:
             if reply_mode == "manual":
@@ -424,14 +464,26 @@ class BargainWorker:
         with self.session_factory() as session:
             repo = QueueRepository(session)
             item = repo.get_item(item_id)
-            if item is not None and opened.binding.seller_id:
-                repo.set_seller_id(item, opened.binding.seller_id)
+            if item is not None:
+                if opened.binding.seller_id:
+                    repo.set_seller_id(item, opened.binding.seller_id)
+                repo.set_product_context(
+                    item,
+                    title=opened.product.title,
+                    list_price_yuan=(
+                        str(opened.product.list_price)
+                        if opened.product.list_price is not None
+                        else None
+                    ),
+                    price_source=opened.product.source,
+                )
 
         session_obj = SellerChatSession(
             client=opened.client,
             generator=self.draft_generator,
             system_prompt=system_prompt,
             opening_brief=opening_brief,
+            product=opened.product,
             decision_system_prompt=decision_system_prompt,
             sleep=self.sleep,
         )
@@ -553,6 +605,20 @@ class BargainWorker:
 
     async def _run_manual_session(self, *, item_id: int, opened: OpenedXianyuChat) -> None:
         """保持一条 CDP 聊天会话，等待卖家消息或用户确认的手动回复。"""
+
+        with self.session_factory() as session:
+            item = QueueRepository(session).get_item(item_id)
+            if item is not None:
+                QueueRepository(session).set_product_context(
+                    item,
+                    title=opened.product.title,
+                    list_price_yuan=(
+                        str(opened.product.list_price)
+                        if opened.product.list_price is not None
+                        else None
+                    ),
+                    price_source=opened.product.source,
+                )
 
         session_obj = SellerChatSession(
             client=opened.client,
@@ -719,24 +785,59 @@ class BargainWorker:
         while True:
             if self._should_abort(item_id):
                 return "done"
+            if _seller_explicitly_asks_buyer_price(session_obj.transcript):
+                text = self._render_default_price_offer(session_obj.product)
+                if text is None:
+                    text = UNKNOWN_PRICE_FOLLOW_UP
+                send_result = await self._send_draft(
+                    item_id=item_id,
+                    session_obj=session_obj,
+                    text=text,
+                    skip_first=skip_first,
+                )
+                if send_result != "seller_reply":
+                    return send_result
+                continue
             proposal = await session_obj.next_decision()
             decision = proposal.decision
             if decision.action != "continue":
                 self._finish_from_decision(item_id, decision)
                 return "done"
-            if proposal.findings:
-                codes = ",".join(f.code for f in proposal.findings)
+            text = decision.message
+            if decision.offer_price_yuan is not None:
+                if not _seller_explicitly_asks_buyer_price(session_obj.transcript):
+                    self._park_for_ai_unavailable(
+                        item_id,
+                        "卖家未明确要求报价，未发送消息；可重新裁决（不重发）",
+                        "offer_without_seller_price_request",
+                    )
+                    return "done"
+                text = self._render_price_offer(decision.offer_price_yuan, session_obj.product)
+                if text is None:
+                    self._park_for_ai_unavailable(
+                        item_id,
+                        "报价不在可靠标价范围内，未发送消息；可重新裁决（不重发）",
+                        "offer_outside_reliable_price_range",
+                    )
+                    return "done"
+            assert text is not None
+            findings = (
+                proposal.findings
+                if decision.message is not None
+                else scan_outbound_draft(text)
+            )
+            if findings:
+                codes = ",".join(f.code for f in findings)
                 self._fail_item(
                     item_id,
                     code="decision_draft_blocked",
                     summary=f"AI 继续消息命中安全规则：{codes}",
                 )
                 return "failed"
-            assert decision.message is not None
             send_result = await self._send_draft(
                 item_id=item_id,
                 session_obj=session_obj,
-                text=decision.message,
+                text=text,
                 skip_first=skip_first,
             )
             if send_result != "seller_reply":
@@ -817,6 +918,39 @@ class BargainWorker:
                     summary=summary,
                     fail_code=fail_code,
                 )
+
+    @staticmethod
+    def _render_price_offer(price_yuan: int, product: ProductContext) -> str | None:
+        """校验智能报价处于标价 70% 至 100% 后生成固定站内议价话术。"""
+
+        upper = product.list_price_yuan_floor
+        if upper is None:
+            return None
+        lower = (upper * 70 + 99) // 100
+        if not lower <= price_yuan <= upper:
+            return None
+        return f"我这边预算能到 {price_yuan} 元，您看方便吗？"
+
+    @staticmethod
+    def _render_default_price_offer(product: ProductContext) -> str | None:
+        """卖家明确要价时，按可靠标价的固定比例生成无需模型裁决的受控报价。"""
+
+        upper = product.list_price_yuan_floor
+        if upper is None:
+            return None
+        lower = (upper * 70 + 99) // 100
+        suggested = (upper * DEFAULT_OFFER_PERCENT + 50) // 100
+        price_yuan = min(upper, max(lower, suggested))
+        return BargainWorker._render_price_offer(price_yuan, product)
+
+    def _park_for_ai_unavailable(self, item_id: int, summary: str, code: str) -> None:
+        """将未发送新消息的模型/报价问题暂挂，供后续不重发地恢复。"""
+
+        with self.session_factory() as session:
+            repo = QueueRepository(session)
+            item = repo.get_item(item_id)
+            if item is not None and item.status == QueueItemStatus.ACTIVE:
+                repo.mark_status(item, QueueItemStatus.PARKED, summary=summary, fail_code=code)
 
     def _park_for_timeout(self, item_id: int) -> None:
         """将首轮或续跑等待超时的 active 项暂挂，避免自动催发。"""

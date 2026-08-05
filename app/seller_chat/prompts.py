@@ -12,6 +12,7 @@ system 提示词，以及生成首轮的商品背景说明。提示词集中在�
 详见 docs/seller-chat-spike.md。
 """
 
+from app.crawler.product_context import ProductContext
 from app.seller_chat.item_url import ItemReference
 
 DEFAULT_GOAL = (
@@ -28,7 +29,8 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你在闲鱼上以买家本人的身份和�
 {{
   "action": "continue|agreed|refused",
   "reason_code": "price_cut|other_concession|no_concession|uncertain",
-  "message": "string or null"
+  "message": "string or null",
+  "offer_price_yuan": "integer or null"
 }}
 
 裁决规则：
@@ -41,7 +43,10 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你在闲鱼上以买家本人的身份和�
 4. 条件报价、信息不足或仍有合理推进空间：action 为 continue，
    reason_code 为 uncertain，message 必须是一条不超过 60 字的自然中文追问。
    每次裁决最多只生成这一条消息，之后等待卖家新的回复。
-5. 不要为了礼貌在 agreed 或 refused 时生成感谢、告别或任何消息；终态只返回 over 信号。
+5. 不要主动报具体金额；仅当卖家明确问买家能出多少时，才可填写 offer_price_yuan，
+   此时 message 必须为 null。其他 continue 必须让 offer_price_yuan 为 null，且 message 不得含金额。
+6. 商品标价未知时绝不填写 offer_price_yuan，只追问卖家最低价。
+7. 不要为了礼貌在 agreed 或 refused 时生成感谢、告别或任何消息；终态只返回 over 信号。
 
 不可违反的硬性约束：
 {constraints}
@@ -84,6 +89,8 @@ OPENING_BRIEF_TEMPLATE = """商品信息：
 - 商品 ID：{item_id}
 - 详情页：{detail_url}
 - 标题：{title}
+- 商品标价：{list_price}
+- 运费：{freight}
 
 下面是这个会话里已有的聊天记录（如果为空说明还没聊过）。请生成要发给卖家的下一条消息。"""
 
@@ -125,7 +132,9 @@ def build_decision_system_prompt(goal: str) -> str:
     )
 
 
-def build_opening_brief(item: ItemReference, title: str | None) -> str:
+def build_opening_brief(
+    item: ItemReference, title: str | None, product: ProductContext | None = None
+) -> str:
     """
     生成首轮 user 消息，向模型交代本次聊天绑定的商品背景。
 
@@ -133,9 +142,18 @@ def build_opening_brief(item: ItemReference, title: str | None) -> str:
     占位文案，提示模型从聊天记录里的商品卡片自行判断。函数无外部副作用。
     """
 
-    normalized_title = (title or "").strip() or UNKNOWN_TITLE
+    context = product or ProductContext()
+    normalized_title = context.title or (title or "").strip() or UNKNOWN_TITLE
     return OPENING_BRIEF_TEMPLATE.format(
         item_id=item.item_id,
         detail_url=item.detail_url,
         title=normalized_title,
+        list_price=_format_money(context.list_price, unknown="未能可靠读取，禁止主动报具体金额"),
+        freight=_format_money(context.freight, unknown="未能可靠读取"),
     )
+
+
+def _format_money(value: object, *, unknown: str) -> str:
+    """将已验证金额展示给模型；未知值使用明确保守说明。"""
+
+    return f"{value} 元" if value is not None else unknown

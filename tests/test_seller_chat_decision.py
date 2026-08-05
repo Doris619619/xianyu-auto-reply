@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import httpx
 import pytest
@@ -76,6 +77,28 @@ def test_parse_decision_accepts_complete_json_code_fence() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("content", "diagnostic_code"),
+    [
+        ("", "completion_envelope_invalid"),
+        ("不是 JSON", "decision_json_invalid"),
+        ('["action", "agreed"]', "decision_not_object"),
+        (
+            '{"action":"continue","reason_code":"uncertain","message":null}',
+            "decision_schema_root_value_error",
+        ),
+    ],
+)
+def test_parse_decision_exposes_only_safe_diagnostic_code(
+    content: str, diagnostic_code: str
+) -> None:
+    """解析失败仅暴露固定诊断码，既可定位原因也不记录模型内容。"""
+
+    with pytest.raises(LlmDecisionOutputError) as caught:
+        _generator()._parse_decision(_response(content))
+
+    assert caught.value.diagnostic_code == diagnostic_code
+
 def test_decision_request_uses_json_mode_but_draft_request_does_not() -> None:
     """仅裁决请求要求供应商输出 JSON，普通消息草稿继续使用文本模式。"""
 
@@ -105,6 +128,86 @@ def test_decision_request_uses_json_mode_but_draft_request_does_not() -> None:
 
     assert "response_format" not in payloads[0]
     assert payloads[1]["response_format"] == {"type": "json_object"}
+
+
+def test_blank_json_mode_response_retries_once_in_text_json_mode() -> None:
+    """JSON mode 空白时只重试一次，且第二次不带 response_format。"""
+
+    payloads: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        if len(payloads) == 1:
+            return _response("   ")
+        return _response('{"action":"refused","reason_code":"no_concession","message":null}')
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        decision = _generator(client=client).decide(
+            system_prompt="请输出 JSON 裁决",
+            opening_brief="商品信息",
+            transcript=[],
+        )
+
+    assert decision.action == "refused"
+    assert payloads[0]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in payloads[1]
+
+
+def test_two_invalid_decision_attempts_expose_retry_exhausted_code(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """两次不合法响应只抛脱敏重试耗尽码，并留下两条可诊断响应记录。"""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        del request
+        return _response("   ")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        with caplog.at_level(logging.INFO, logger="app.decision_payload"):
+            with pytest.raises(LlmDecisionOutputError) as caught:
+                _generator(client=client).decide(
+                    system_prompt="请输出 JSON 裁决",
+                    opening_brief="商品信息",
+                    transcript=[],
+                )
+
+    assert caught.value.diagnostic_code == "decision_retry_exhausted_completion_envelope_invalid"
+    records = [json.loads(record.getMessage()) for record in caplog.records]
+    assert [(record["attempt"], record["mode"]) for record in records] == [
+        (1, "json_object"),
+        (2, "text_json_fallback"),
+    ]
+
+
+def test_decision_response_log_keeps_model_content_without_request_secrets(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """调试日志保存模型响应正文与包络元数据，不记录请求提示词或认证信息。"""
+
+    content = '{"action":"refused","reason_code":"no_concession","message":null}'
+    with caplog.at_level(logging.INFO, logger="app.decision_payload"):
+        _generator()._parse_decision(_response(content))
+
+    record = json.loads(caplog.records[-1].getMessage())
+    assert record["event"] == "deepseek_decision_response"
+    assert record["assistant_content"] == content
+    assert record["finish_reason"] == "stop"
+    assert "Authorization" not in record["raw_response"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"action":"continue","reason_code":"uncertain","message":"300 可以吗"}',
+        '{"action":"continue","reason_code":"uncertain","message":"再聊聊","offer_price_yuan":300}',
+        '{"action":"continue","reason_code":"uncertain","message":null,"offer_price_yuan":0}',
+    ],
+)
+def test_decision_rejects_uncontrolled_numeric_offer(content: str) -> None:
+    """普通消息不能夹带数字报价，金额只能经独立受控字段交给 Worker。"""
+
+    with pytest.raises(LlmDecisionOutputError):
+        _generator()._parse_decision(_response(content))
 
 @pytest.mark.parametrize(
     "content",

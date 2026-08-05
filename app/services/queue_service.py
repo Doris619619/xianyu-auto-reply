@@ -271,6 +271,8 @@ def _to_item_out(item: QueueItem, rank: int | None) -> QueueItemOut:
         item_id=item.item_id,
         detail_url=item.detail_url,
         title=item.title,
+        list_price_yuan=item.list_price_yuan,
+        price_source=item.price_source,
         status=item.status,
         position=item.position,
         position_rank=rank,

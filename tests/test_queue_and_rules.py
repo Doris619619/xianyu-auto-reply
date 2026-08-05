@@ -46,6 +46,30 @@ def test_init_db_upgrades_legacy_queue_table_with_send_diagnostic(tmp_path: Path
         columns = {row[1] for row in connection.execute("PRAGMA table_info(queue_items)")}
     assert "processing_reply_mode" in columns
     assert "send_diagnostic" in columns
+    assert "list_price_yuan" in columns
+    assert "price_source" in columns
+
+
+def test_product_price_context_is_persisted_and_exposed(session_factory: sessionmaker) -> None:
+    """详情页主价读取结果应经队列 API 供面板展示。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("1067489371528")
+    with session_factory() as session:
+        repo = QueueRepository(session)
+        row = repo.get_item(item.id)
+        assert row is not None
+        repo.set_product_context(
+            row,
+            title="测试商品",
+            list_price_yuan="86.00",
+            price_source="dom_main",
+        )
+
+    out = service.list_queue().items[0]
+    assert out.title == "测试商品"
+    assert str(out.list_price_yuan) == "86.00"
+    assert out.price_source == "dom_main"
 
 
 def test_parse_item_id_only() -> None:

@@ -9,11 +9,12 @@
 复用 app.ai.deepseek 的 DeepSeekConfig 与响应包络解析，保证密钥处理和「必须自然结束」
 的契约与生产链路完全一致。
 
-本文件不做发送前安全校验（由 guardrails.py 负责）、不接触 Playwright、不访问数据库，
-也不记录密钥、提示词或卖家原文。
+本文件不做发送前安全校验（由 guardrails.py 负责）、不接触 Playwright、不访问数据库。
+裁决请求会把供应商响应写入仅本机保留的调试日志；不记录密钥、请求提示词或卖家原文。
 """
 
 import json
+import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -27,12 +28,16 @@ from app.ai.deepseek import DeepSeekConfig, _extract_completed_content
 from app.seller_chat.prompts import FOLLOW_UP_NUDGE
 
 MAX_DRAFT_CHARACTERS = 500
+MAX_DECISION_RESPONSE_LOG_CHARACTERS = 30_000
+
+decision_payload_logger = logging.getLogger("app.decision_payload")
 
 # 只兼容整个回答被 Markdown 代码块包裹的 JSON，不能容忍前后夹带解释文字。
 _COMPLETE_JSON_CODE_FENCE = re.compile(
     r"\A```(?:json)?[ \t]*\r?\n(?P<content>.*?)\r?\n?```\Z",
     re.IGNORECASE | re.DOTALL,
 )
+_PLAIN_AMOUNT = re.compile(r"(?<!\d)\d{1,9}(?:\.\d{1,2})?(?!\d)")
 
 Speaker = Literal["me", "seller"]
 NegotiationAction = Literal["continue", "agreed", "refused"]
@@ -98,6 +103,17 @@ class LlmDecisionOutputError(LlmOutputError):
     code = "llm_decision_output_invalid"
     safe_message = "DeepSeek 返回的议价裁决格式不可用"
 
+    def __init__(self, diagnostic_code: str = "decision_unknown") -> None:
+        """
+        使用固定异常文案和脱敏诊断码构造裁决输出异常。
+
+        diagnostic_code 只能由本模块的固定分支产生，供 Worker 写入诊断日志；不包含模型
+        原文、聊天记录或密钥。
+        """
+
+        self.diagnostic_code = diagnostic_code
+        super().__init__()
+
 
 class NegotiationDecision(BaseModel):
     """
@@ -112,19 +128,28 @@ class NegotiationDecision(BaseModel):
     action: NegotiationAction
     reason_code: NegotiationReasonCode
     message: str | None = None
+    offer_price_yuan: int | None = None
 
     @model_validator(mode="after")
     def validate_action_contract(self) -> Self:
         """校验 action、原因码与消息字段的固定组合。"""
 
         if self.action == "continue":
-            if self.reason_code != "uncertain" or not self.message:
-                raise ValueError("continue 必须携带 uncertain 原因和非空 message")
+            if self.reason_code != "uncertain":
+                raise ValueError("continue 必须携带 uncertain 原因")
+            if self.offer_price_yuan is not None:
+                if self.offer_price_yuan <= 0 or self.message is not None:
+                    raise ValueError("报价 continue 只能携带正整数 offer_price_yuan")
+                return self
+            if not self.message:
+                raise ValueError("非报价 continue 必须携带 message")
             if len(self.message) > 200:
                 raise ValueError("continue 的 message 超过 200 字")
+            if _PLAIN_AMOUNT.search(self.message):
+                raise ValueError("普通 continue message 不得包含数值报价")
             return self
-        if self.message is not None:
-            raise ValueError("终态裁决不得携带 message")
+        if self.message is not None or self.offer_price_yuan is not None:
+            raise ValueError("终态裁决不得携带 message 或 offer_price_yuan")
         if self.action == "agreed" and self.reason_code in {
             "price_cut",
             "other_concession",
@@ -268,21 +293,36 @@ class SellerChatDraftGenerator:
         格式错误、超时或传输失败抛出 SellerChatLlmError，调用方必须失败关闭且不得发送。
         """
 
-        payload: dict[str, Any] = {
-            "model": self._config.model,
-            "messages": build_chat_messages(
-                system_prompt=system_prompt,
-                opening_brief=opening_brief,
-                transcript=transcript,
-            ),
-            "temperature": self._config.temperature,
-            "max_tokens": self._config.max_tokens,
-            "stream": False,
-            "thinking": {"type": "disabled"},
-            "response_format": {"type": "json_object"},
-        }
-        response = self._request_completion(payload)
-        return self._parse_decision(response)
+        last_error: LlmDecisionOutputError | None = None
+        for attempt, json_mode in enumerate((True, False), start=1):
+            retry_prompt = system_prompt if json_mode else (
+                f"{system_prompt}\n上一轮没有得到可用内容。现在必须直接输出非空 JSON 对象。"
+            )
+            payload: dict[str, Any] = {
+                "model": self._config.model,
+                "messages": build_chat_messages(
+                    system_prompt=retry_prompt,
+                    opening_brief=opening_brief,
+                    transcript=transcript,
+                ),
+                "temperature": self._config.temperature,
+                "max_tokens": self._config.max_tokens,
+                "stream": False,
+                "thinking": {"type": "disabled"},
+            }
+            if json_mode:
+                payload["response_format"] = {"type": "json_object"}
+            response = self._request_completion(payload)
+            try:
+                return self._parse_decision(
+                    response,
+                    attempt=attempt,
+                    mode="json_object" if json_mode else "text_json_fallback",
+                )
+            except LlmDecisionOutputError as error:
+                last_error = error
+        assert last_error is not None
+        raise LlmDecisionOutputError(f"decision_retry_exhausted_{last_error.diagnostic_code}")
 
     def close(self) -> None:
         """
@@ -371,21 +411,28 @@ class SellerChatDraftGenerator:
             raise LlmOutputError
         return draft
 
-    def _parse_decision(self, response: httpx.Response) -> NegotiationDecision:
+    def _parse_decision(
+        self, response: httpx.Response, *, attempt: int = 1, mode: str = "test"
+    ) -> NegotiationDecision:
         """从完成响应中解析并严格校验结构化议价裁决。"""
 
+        _log_decision_response(response, attempt=attempt, mode=mode)
         try:
-            content = _extract_completed_content(response.json())
+            body = response.json()
+            content = _extract_completed_content(body)
+        except (AiOutputError, UnicodeDecodeError, ValueError, TypeError):
+            raise LlmDecisionOutputError("completion_envelope_invalid") from None
+
+        try:
             parsed = json.loads(_unwrap_complete_json_code_fence(content))
+        except (UnicodeDecodeError, ValueError, TypeError):
+            raise LlmDecisionOutputError("decision_json_invalid") from None
+        if not isinstance(parsed, dict):
+            raise LlmDecisionOutputError("decision_not_object")
+        try:
             return NegotiationDecision.model_validate(parsed)
-        except (
-            AiOutputError,
-            UnicodeDecodeError,
-            ValidationError,
-            ValueError,
-            TypeError,
-        ):
-            raise LlmDecisionOutputError from None
+        except ValidationError as error:
+            raise LlmDecisionOutputError(_validation_diagnostic_code(error)) from None
 
 
 def _unwrap_complete_json_code_fence(content: str) -> str:
@@ -401,3 +448,77 @@ def _unwrap_complete_json_code_fence(content: str) -> str:
     if match is None:
         return normalized
     return match.group("content").strip()
+
+
+def _validation_diagnostic_code(error: ValidationError) -> str:
+    """
+    将 Pydantic 校验错误压缩成不含模型值的稳定诊断码。
+
+    输入为结构校验异常；返回仅由字段位置和错误类型组成的短码，避免把模型输出写入日志。
+    """
+
+    details = error.errors(include_input=False)
+    if not details:
+        return "decision_schema_invalid"
+    first = details[0]
+    location = "_".join(str(part) for part in first.get("loc", ())) or "root"
+    error_type = str(first.get("type", "invalid")).replace(".", "_")
+    return f"decision_schema_{location}_{error_type}"[:120]
+
+
+def _log_decision_response(response: httpx.Response, *, attempt: int, mode: str) -> None:
+    """
+    将裁决请求的供应商响应保存到本机 JSONL 调试日志。
+
+    输入为 HTTP 响应；仅记录状态码、完成包络元数据、模型 assistant_content 和原始响应体，
+    以定位供应商格式问题。请求提示词、Authorization、Cookie 和登录态均不在此处记录；
+    响应体超过上限会截断并标记，避免无限制占用本机磁盘。
+    """
+
+    raw_response = response.text
+    was_truncated = len(raw_response) > MAX_DECISION_RESPONSE_LOG_CHARACTERS
+    record: dict[str, object] = {
+        "event": "deepseek_decision_response",
+        "attempt": attempt,
+        "mode": mode,
+        "status_code": response.status_code,
+        "raw_response": raw_response[:MAX_DECISION_RESPONSE_LOG_CHARACTERS],
+        "raw_response_truncated": was_truncated,
+    }
+    try:
+        body = json.loads(raw_response)
+    except (UnicodeDecodeError, ValueError, TypeError):
+        record["response_json_decoded"] = False
+    else:
+        record["response_json_decoded"] = True
+        _append_completion_metadata(record, body)
+    decision_payload_logger.info(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+
+
+def _append_completion_metadata(record: dict[str, object], body: object) -> None:
+    """
+    从供应商响应提取不经校验的完成包络元数据和模型正文。
+
+    输入为日志记录和已解码响应；即使包络非法也仅写入可观察的类型、数量与 content，
+    不抛异常、不修改响应，也不记录请求侧信息。
+    """
+
+    if not isinstance(body, dict):
+        record["response_body_type"] = type(body).__name__
+        return
+    choices = body.get("choices")
+    record["choices_type"] = type(choices).__name__
+    record["choices_count"] = len(choices) if isinstance(choices, list) else None
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return
+    choice = choices[0]
+    record["finish_reason"] = choice.get("finish_reason")
+    message = choice.get("message")
+    record["message_type"] = type(message).__name__
+    if not isinstance(message, dict):
+        return
+    record["message_role"] = message.get("role")
+    content = message.get("content")
+    record["assistant_content"] = content if isinstance(content, str) else None
+    record["assistant_content_type"] = type(content).__name__
+    record["assistant_content_length"] = len(content) if isinstance(content, str) else None

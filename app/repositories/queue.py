@@ -233,6 +233,25 @@ class QueueRepository:
         self._session.refresh(item)
         return item
 
+    def set_product_context(
+        self,
+        item: QueueItem,
+        *,
+        title: str | None,
+        list_price_yuan: str | None,
+        price_source: str,
+    ) -> QueueItem:
+        """保存本次打开详情页得到的主价读取结果，供面板和后续报价共用。"""
+
+        if title:
+            item.title = title
+        item.list_price_yuan = list_price_yuan
+        item.price_source = price_source
+        item.updated_at = datetime.now(UTC)
+        self._session.commit()
+        self._session.refresh(item)
+        return item
+
     def retry_parked(self, item: QueueItem) -> QueueItem:
         """
         将 parked 项重新入队到队尾。

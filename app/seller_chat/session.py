@@ -23,6 +23,7 @@ from app.crawler.chat_client import (
     normalize_chat_text,
 )
 from app.crawler.chat_runtime import ProcurementChatClient
+from app.crawler.product_context import ProductContext
 from app.seller_chat.guardrails import (
     GuardrailFinding,
     scan_inbound_message,
@@ -116,6 +117,7 @@ class SellerChatSession:
         generator: SellerChatDraftGenerator,
         system_prompt: str,
         opening_brief: str,
+        product: ProductContext | None = None,
         decision_system_prompt: str | None = None,
         sleep: SLEEP_CALLABLE | None = None,
     ) -> None:
@@ -131,6 +133,7 @@ class SellerChatSession:
         self._system_prompt = system_prompt
         self._decision_system_prompt = decision_system_prompt or system_prompt
         self._opening_brief = opening_brief
+        self.product = product or ProductContext()
         self._sleep: SLEEP_CALLABLE = sleep if sleep is not None else _default_sleep
         self._transcript: list[TranscriptEntry] = []
         self._latest_fingerprint = empty_conversation_fingerprint()

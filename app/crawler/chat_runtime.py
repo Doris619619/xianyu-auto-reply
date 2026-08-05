@@ -18,6 +18,7 @@ from app.crawler.chat_client import (
     PolicyAllowedDraft,
     SendEvidence,
 )
+from app.crawler.product_context import ProductContext
 
 # 可选恢复钩子：返回 True 表示已处理验证并应重新检查页面风险。
 RiskRecoveryHook = Callable[[Page], Awaitable[bool]]
@@ -62,6 +63,7 @@ class OpenedXianyuChat:
 
     binding: ChatBinding
     client: ProcurementChatClient
+    product: ProductContext = ProductContext()
 
 
 class ProcurementChatFactory(Protocol):
