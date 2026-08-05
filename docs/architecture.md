@@ -72,9 +72,11 @@ data/browser_states/
 4. 新链接只追加队尾
 5. 优先插队：当前 `active` → `done_manual(preempted)`，目标插到队首
 6. 浏览器 context 长驻，每个商品新开 page
+7. 卖家新回复由 AI 基于完整会话输出结构化裁决：`continue` 才允许发送一条后续消息，`agreed` / `refused` 只写终态信号
 
 ## 安全边界
 
 - 允许议价；禁止外链、站外联系、支付、地址、验证码、拍下/付款承诺
 - 发送结果不确定 → `failed`，禁止自动重试
+- AI 裁决格式异常、超时或继续消息触发安全规则 → `failed`，不得回退到关键词规则或发送消息
 - 登录态与密钥仅本地 `.env` / 各后端 storage_state 文件，不入库、不进 Git

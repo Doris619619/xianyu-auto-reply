@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -22,8 +23,11 @@ from app.crawler.chat_client import (
     item_url_matches_binding,
 )
 from app.crawler.chat_runtime import OpenedXianyuChat, RiskRecoveryHook
+from app.crawler.product_context import extract_product_context
 from app.crawler.risk_control import detect_risk_response
 from app.services.xianyu_account_guard import AccountAccessGuard
+
+product_context_logger = logging.getLogger("app.decision_diagnostic")
 
 
 class PersistentPlaywrightChatFactory:
@@ -128,6 +132,14 @@ class PersistentPlaywrightChatFactory:
                         risk_reason = blocked_reason or detect_risk_response(page.url, 0)
                     if risk_reason:
                         raise ChatSafetyError("http_risk_blocked", risk_reason)
+                product = await extract_product_context(page)
+                product_context_logger.info(
+                    "source_item_id=%s product_context_source=%s list_price=%s freight=%s",
+                    source_item_id,
+                    product.source,
+                    product.list_price,
+                    product.freight,
+                )
                 binding = await discover_chat_binding(
                     page,
                     source_item_id=source_item_id,
@@ -143,6 +155,7 @@ class PersistentPlaywrightChatFactory:
                 yield OpenedXianyuChat(
                     binding=binding,
                     client=XianyuChatClient(page, binding, self._account_guard),
+                    product=product,
                 )
                 return
             except ChatSafetyError:

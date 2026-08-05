@@ -24,8 +24,8 @@ SQLite 默认路径：`./data/bargain.db`（可用 `DATABASE_URL` 覆盖）。
 - `queued` 排队  
 - `active` 当前锁定  
 - `parked` 超时暂挂  
-- `done_agreed` 同意降价  
-- `done_refused` 明确不降  
+- `done_agreed` 已谈成（明确降价、包邮、赠品或其他让利）
+- `done_refused` 未谈成（AI 判定没有可继续协商的空间）
 - `done_manual` 手动结束 / 被插队 / 达轮次上限  
 - `failed` 风控、发送不确定、草稿拦截等  
 

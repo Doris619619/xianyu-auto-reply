@@ -14,7 +14,6 @@ from sqlalchemy.orm import sessionmaker
 
 from app.models import QueueItemStatus, init_db
 from app.repositories.queue import QueueRepository
-from app.seller_chat.goal_outcome import seller_agreed_to_price_cut, seller_refused_price_cut
 from app.seller_chat.guardrails import scan_outbound_draft
 from app.seller_chat.item_url import ItemUrlError, parse_item_reference
 from app.services.queue_service import QueueService, QueueServiceError
@@ -47,6 +46,30 @@ def test_init_db_upgrades_legacy_queue_table_with_send_diagnostic(tmp_path: Path
         columns = {row[1] for row in connection.execute("PRAGMA table_info(queue_items)")}
     assert "processing_reply_mode" in columns
     assert "send_diagnostic" in columns
+    assert "list_price_yuan" in columns
+    assert "price_source" in columns
+
+
+def test_product_price_context_is_persisted_and_exposed(session_factory: sessionmaker) -> None:
+    """详情页主价读取结果应经队列 API 供面板展示。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("1067489371528")
+    with session_factory() as session:
+        repo = QueueRepository(session)
+        row = repo.get_item(item.id)
+        assert row is not None
+        repo.set_product_context(
+            row,
+            title="测试商品",
+            list_price_yuan="86.00",
+            price_source="dom_main",
+        )
+
+    out = service.list_queue().items[0]
+    assert out.title == "测试商品"
+    assert str(out.list_price_yuan) == "86.00"
+    assert out.price_source == "dom_main"
 
 
 def test_parse_item_id_only() -> None:
@@ -61,14 +84,6 @@ def test_parse_rejects_non_goofish() -> None:
 
     with pytest.raises(ItemUrlError):
         parse_item_reference("https://example.com/item?id=1")
-
-
-def test_agree_and_refuse_detection() -> None:
-    """同意与拒绝降价的确定性判定。"""
-
-    assert seller_agreed_to_price_cut(["可以便宜一点"])
-    assert seller_refused_price_cut(["不能再便宜了，一口价"])
-    assert not seller_agreed_to_price_cut(["不能再便宜了，一口价"])
 
 
 def test_outbound_allows_negotiation_blocks_payment() -> None:

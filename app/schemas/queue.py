@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -54,6 +55,8 @@ class QueueItemOut(BaseModel):
     item_id: str
     detail_url: str
     title: str | None
+    list_price_yuan: Decimal | None = None
+    price_source: str | None = None
     status: str
     position: int
     position_rank: int | None = None

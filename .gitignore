@@ -27,6 +27,7 @@ venv/
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+data/logs/
 .pytest_tmp/
 
 # 前端构建

@@ -7,11 +7,27 @@ const statusLabel = {
   queued: "排队中",
   active: "进行中",
   parked: "暂挂",
-  done_agreed: "同意降价",
-  done_refused: "明确不降",
+  done_agreed: "已谈成",
+  done_refused: "未谈成",
   done_manual: "已手动结束",
   failed: "失败",
 };
+
+const priceSourceLabel = {
+  structured: "结构化数据",
+  metadata: "商品元数据",
+  dom_main: "详情主价",
+  dom_viewport: "首屏价格",
+  visible: "页面文本",
+};
+
+function productPriceHint(item) {
+  if (item.list_price_yuan !== null && item.list_price_yuan !== undefined) {
+    const source = priceSourceLabel[item.price_source] || "已读取";
+    return `商品主价 ¥${item.list_price_yuan}（${source}）`;
+  }
+  return "商品主价未读取";
+}
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -74,8 +90,11 @@ async function refreshQueue() {
         );
       }
       if (item.status === "parked") {
+        const decisionRetry = String(item.fail_code || "").startsWith(
+          "decision_retry_exhausted_"
+        );
         actions.push(
-          `<button class="small" data-act="retry" data-id="${item.id}">重试</button>`
+          `<button class="small" data-act="retry" data-id="${item.id}">${decisionRetry ? "重新裁决（不重发）" : "重试"}</button>`
         );
       }
       if (item.status === "failed" && item.rounds_sent > 0) {
@@ -98,6 +117,7 @@ async function refreshQueue() {
         </div>
         <div class="hint">ID ${item.item_id} · 已发 ${item.rounds_sent} 轮
           ${item.result_summary ? " · " + item.result_summary : ""}</div>
+        <div class="hint">${productPriceHint(item)}</div>
         ${sendDiagnosticHint(item.send_diagnostic)}
         <div class="item-actions">${actions.join("")}</div>
       </article>`;
