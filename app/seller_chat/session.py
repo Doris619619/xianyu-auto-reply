@@ -194,17 +194,18 @@ class SellerChatSession:
         draft = text.strip()
         return DraftProposal(text=draft, findings=scan_outbound_draft(draft))
 
-    async def next_decision(self) -> DecisionProposal:
+    async def next_decision(self, *, system_prompt: str | None = None) -> DecisionProposal:
         """
         基于完整聊天记录请求本轮继续或结束的结构化议价裁决。
 
-        返回 agreed / refused 时不会包含外发消息；返回 continue 时会扫描模型给出的唯一
-        后续消息。模型输出异常向上抛出，调用方必须失败关闭而不能回退关键词规则。
+        返回库存或议价终态时不会包含外发消息；返回 continue 时会扫描模型给出的唯一
+        后续消息。可选 ``system_prompt`` 让 Worker 按当前库存/议价阶段约束裁决；模型输出
+        异常向上抛出，调用方必须失败关闭而不能回退关键词规则。
         """
 
         decision = await asyncio.to_thread(
             self._generator.decide,
-            system_prompt=self._decision_system_prompt,
+            system_prompt=system_prompt or self._decision_system_prompt,
             opening_brief=self._opening_brief,
             transcript=self.transcript,
         )

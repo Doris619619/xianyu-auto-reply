@@ -40,7 +40,11 @@ from app.seller_chat.llm import (
 )
 from app.seller_chat.session import empty_conversation_fingerprint
 from app.services.queue_service import QueueService
-from app.worker.bargain_worker import BargainWorker
+from app.worker.bargain_worker import (
+    AVAILABILITY_OPENING,
+    NEGOTIATION_OPENING,
+    BargainWorker,
+)
 
 ACCOUNT = "a" * 64
 
@@ -60,11 +64,19 @@ def _snapshot(direction: str, text: str, message_id: str) -> ChatMessageSnapshot
 class FakeChatClient:
     """内存 Fake 聊天客户端。"""
 
-    def __init__(self, *, inbound_script: list[list[ChatMessageSnapshot]] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        inbound_script: list[list[ChatMessageSnapshot]] | None = None,
+        auto_availability_response: bool = True,
+    ) -> None:
         self.messages: list[ChatMessageSnapshot] = []
         self.inbound_script = [list(batch) for batch in (inbound_script or [])]
         self.sent: list[str] = []
         self._inject_ready = False
+        self._availability_response_pending = (
+            auto_availability_response and bool(self.inbound_script)
+        )
 
     async def open_conversation(self) -> ChatMessageSnapshot:
         return await self.read_latest_message()
@@ -81,7 +93,11 @@ class FakeChatClient:
 
     async def read_messages_after(self, baseline_fingerprint: str) -> list[ChatMessageSnapshot]:
         # 仅在发送后才注入卖家回复，避免 start() 读历史时提前消费脚本。
-        if self._inject_ready and self.inbound_script:
+        if self._inject_ready and self._availability_response_pending:
+            self.messages.append(_snapshot("seller", "还在", "availability-confirmed"))
+            self._availability_response_pending = False
+            self._inject_ready = False
+        elif self._inject_ready and self.inbound_script:
             self.messages.extend(self.inbound_script.pop(0))
             self._inject_ready = False
         if baseline_fingerprint == empty_conversation_fingerprint():
@@ -260,19 +276,28 @@ class FixedDraftGenerator(SellerChatDraftGenerator):
         self,
         text: str = "老板能便宜一点吗",
         decisions: list[NegotiationDecision] | None = None,
+        *,
+        prepend_availability_decision: bool = True,
     ) -> None:
         super().__init__(DeepSeekConfig(api_key=SecretStr("x" * 32)))
         self._text = text
-        self._decisions = list(
-            decisions
-            or [
+        configured_decisions = decisions or [
                 NegotiationDecision(
                     action="agreed",
                     reason_code="price_cut",
                     message=None,
                 )
             ]
-        )
+        self._decisions = list(configured_decisions)
+        if prepend_availability_decision:
+            self._decisions.insert(
+                0,
+                NegotiationDecision(
+                    action="available",
+                    reason_code="in_stock",
+                    message=None,
+                ),
+            )
 
     def generate(self, **kwargs: Any) -> str:  # type: ignore[override]
         del kwargs
@@ -304,6 +329,8 @@ class DecisionMustNotRunGenerator(FixedDraftGenerator):
 
     def decide(self, **kwargs: Any) -> NegotiationDecision:  # type: ignore[override]
         del kwargs
+        if self._decisions:
+            return self._decisions.pop(0)
         raise AssertionError("明确要价不应调用模型裁决")
 
 
@@ -362,6 +389,8 @@ async def test_worker_timeout_parks_then_next(session_factory: sessionmaker) -> 
         row = QueueRepository(session).get_item(first.id)
         assert row is not None
         assert row.status == QueueItemStatus.PARKED
+        assert row.goods_available is None
+        assert row.over is False
 
     id2 = worker._claim_next_id()
     assert id2 == second.id
@@ -409,7 +438,223 @@ async def test_ai_marks_free_shipping_concession_as_agreed_without_extra_message
         assert row.status == QueueItemStatus.DONE_AGREED
         assert row.result_summary == "AI 判定：卖家提供明确让利"
         assert row.fail_code == "ai_agreed"
-    assert client.sent == ["老板能便宜一点吗"]
+        assert row.goods_available is True
+        assert row.over is True
+    assert client.sent == [AVAILABILITY_OPENING, NEGOTIATION_OPENING]
+
+
+@pytest.mark.asyncio
+async def test_seller_unavailable_ends_without_sending_negotiation(
+    session_factory: sessionmaker,
+) -> None:
+    """卖家明确无货时，必须立即写入无货和结束信号。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("10101")
+    client = FakeChatClient(
+        inbound_script=[[_snapshot("seller", "已经卖掉了", "m-unavailable")]],
+        auto_availability_response=False,
+    )
+    worker = BargainWorker(
+        session_factory=session_factory,
+        chat_factory=FakeFactory({"10101": client}),
+        draft_generator=FixedDraftGenerator(
+            decisions=[
+                NegotiationDecision(
+                    action="unavailable",
+                    reason_code="out_of_stock",
+                    message=None,
+                )
+            ],
+            prepend_availability_decision=False,
+        ),
+        expected_account_id=ACCOUNT,
+    )
+
+    item_id = worker._claim_next_id()
+    assert item_id == item.id
+    await worker._process_item(item_id)
+
+    with session_factory() as session:
+        row = QueueRepository(session).get_item(item.id)
+        assert row is not None
+        assert row.status == QueueItemStatus.DONE_UNAVAILABLE
+        assert row.goods_available is False
+        assert row.over is True
+        assert row.conversation_phase == "finished"
+    assert client.sent == [AVAILABILITY_OPENING]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_availability_only_sends_availability_follow_up(
+    session_factory: sessionmaker,
+) -> None:
+    """库存回复不明确时，只能继续确认库存，不能提前开始议价。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("10102")
+    client = FakeChatClient(
+        inbound_script=[
+            [_snapshot("seller", "什么意思？", "m-ambiguous")],
+            [_snapshot("seller", "没有了", "m-unavailable-after-clarify")],
+        ],
+        auto_availability_response=False,
+    )
+    worker = BargainWorker(
+        session_factory=session_factory,
+        chat_factory=FakeFactory({"10102": client}),
+        draft_generator=FixedDraftGenerator(
+            decisions=[
+                NegotiationDecision(
+                    action="continue",
+                    reason_code="uncertain",
+                    message="请问这个商品现在还在售吗？",
+                ),
+                NegotiationDecision(
+                    action="unavailable",
+                    reason_code="out_of_stock",
+                    message=None,
+                ),
+            ],
+            prepend_availability_decision=False,
+        ),
+        expected_account_id=ACCOUNT,
+    )
+
+    item_id = worker._claim_next_id()
+    assert item_id == item.id
+    await worker._process_item(item_id)
+
+    with session_factory() as session:
+        row = QueueRepository(session).get_item(item.id)
+        assert row is not None
+        assert row.status == QueueItemStatus.DONE_UNAVAILABLE
+        assert row.goods_available is False
+        assert row.over is True
+    assert client.sent == [AVAILABILITY_OPENING, "请问这个商品现在还在售吗？"]
+
+
+@pytest.mark.asyncio
+async def test_availability_phase_rejects_numeric_offer_without_faking_signals(
+    session_factory: sessionmaker,
+) -> None:
+    """库存阶段收到非法报价裁决时，不得发送议价或伪造库存、结束信号。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("101021")
+    client = FakeChatClient(
+        inbound_script=[[_snapshot("seller", "你想问什么？", "m-invalid-availability")]],
+        auto_availability_response=False,
+    )
+    worker = BargainWorker(
+        session_factory=session_factory,
+        chat_factory=FakeFactory({"101021": client}),
+        draft_generator=FixedDraftGenerator(
+            decisions=[
+                NegotiationDecision(
+                    action="continue",
+                    reason_code="uncertain",
+                    offer_price_yuan=100,
+                )
+            ],
+            prepend_availability_decision=False,
+        ),
+        expected_account_id=ACCOUNT,
+    )
+
+    item_id = worker._claim_next_id()
+    assert item_id == item.id
+    await worker._process_item(item_id)
+
+    with session_factory() as session:
+        row = QueueRepository(session).get_item(item.id)
+        assert row is not None
+        assert row.status == QueueItemStatus.PARKED
+        assert row.goods_available is None
+        assert row.over is False
+        assert row.fail_code == "availability_phase_offer_invalid"
+    assert client.sent == [AVAILABILITY_OPENING]
+
+
+@pytest.mark.asyncio
+async def test_seller_becomes_unavailable_during_negotiation_ends_immediately(
+    session_factory: sessionmaker,
+) -> None:
+    """议价过程中改称无货，也必须覆盖为无货终态。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("10103")
+    client = FakeChatClient(
+        inbound_script=[[_snapshot("seller", "刚刚已经卖掉了", "m-late-unavailable")]]
+    )
+    worker = BargainWorker(
+        session_factory=session_factory,
+        chat_factory=FakeFactory({"10103": client}),
+        draft_generator=FixedDraftGenerator(
+            decisions=[
+                NegotiationDecision(
+                    action="unavailable",
+                    reason_code="out_of_stock",
+                    message=None,
+                )
+            ]
+        ),
+        expected_account_id=ACCOUNT,
+    )
+
+    item_id = worker._claim_next_id()
+    assert item_id == item.id
+    await worker._process_item(item_id)
+
+    with session_factory() as session:
+        row = QueueRepository(session).get_item(item.id)
+        assert row is not None
+        assert row.status == QueueItemStatus.DONE_UNAVAILABLE
+        assert row.goods_available is False
+        assert row.over is True
+    assert client.sent == [AVAILABILITY_OPENING, NEGOTIATION_OPENING]
+
+
+@pytest.mark.asyncio
+async def test_resumed_availability_stage_does_not_repeat_inventory_opening(
+    session_factory: sessionmaker,
+) -> None:
+    """重启后应沿用已发送的查库存问题，只发送尚未发送的议价开场。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("10104")
+    service.update_settings(max_rounds=2)
+    with session_factory() as session:
+        repo = QueueRepository(session)
+        row = repo.claim_next_queued()
+        assert row is not None and row.id == item.id
+        repo.bump_rounds(row)
+
+    client = FakeChatClient()
+    client.messages.extend(
+        [
+            _snapshot("self", AVAILABILITY_OPENING, "out-existing-availability"),
+            _snapshot("seller", "还在", "m-resume-available"),
+        ]
+    )
+
+    worker = BargainWorker(
+        session_factory=session_factory,
+        chat_factory=FakeFactory({"10104": client}),
+        draft_generator=FixedDraftGenerator(),
+        expected_account_id=ACCOUNT,
+    )
+
+    await worker._process_item(item.id)
+
+    with session_factory() as session:
+        row = QueueRepository(session).get_item(item.id)
+        assert row is not None
+        assert row.status == QueueItemStatus.DONE_MANUAL
+        assert row.conversation_phase == "finished"
+        assert row.goods_available is True
+        assert row.over is True
+    assert client.sent == [NEGOTIATION_OPENING]
 
 
 @pytest.mark.asyncio
@@ -456,8 +701,14 @@ async def test_ai_continue_sends_one_follow_up_then_can_end_refused(
         assert row.status == QueueItemStatus.DONE_REFUSED
         assert row.result_summary == "AI 判定：没有可继续协商的空间"
         assert row.fail_code == "ai_refused"
-        assert row.rounds_sent == 2
-    assert client.sent == ["老板能便宜一点吗", "如果包邮的话可以吗？"]
+        assert row.rounds_sent == 3
+        assert row.goods_available is True
+        assert row.over is True
+    assert client.sent == [
+        AVAILABILITY_OPENING,
+        NEGOTIATION_OPENING,
+        "如果包邮的话可以吗？",
+    ]
 
 
 @pytest.mark.asyncio
@@ -487,10 +738,12 @@ async def test_invalid_ai_decision_fails_closed_without_sending_follow_up(
         assert row is not None
         assert row.status == QueueItemStatus.FAILED
         assert row.fail_code == "llm_decision_output_invalid"
+        assert row.goods_available is None
+        assert row.over is False
         assert row.result_summary == (
             "DeepSeek 返回的议价裁决格式不可用（诊断：decision_json_invalid）"
         )
-    assert client.sent == ["老板能便宜一点吗"]
+    assert client.sent == [AVAILABILITY_OPENING]
 
 
 @pytest.mark.asyncio
@@ -521,7 +774,7 @@ async def test_exhausted_decision_retry_parks_without_sending_follow_up(
         assert row.status == QueueItemStatus.PARKED
         assert row.fail_code == "decision_retry_exhausted_completion_envelope_invalid"
         assert row.result_summary == "AI 暂不可用，未发送消息；可重新裁决（不重发）"
-    assert client.sent == ["老板能便宜一点吗"]
+    assert client.sent == [AVAILABILITY_OPENING]
 
 
 @pytest.mark.asyncio
@@ -549,7 +802,11 @@ async def test_explicit_price_request_uses_default_offer_without_calling_llm(
     assert item_id == item.id
     await worker._process_item(item_id)
 
-    assert client.sent == ["老板能便宜一点吗", "我这边预算能到 850 元，您看方便吗？"]
+    assert client.sent == [
+        AVAILABILITY_OPENING,
+        NEGOTIATION_OPENING,
+        "我这边预算能到 850 元，您看方便吗？",
+    ]
 
 
 @pytest.mark.asyncio
@@ -577,7 +834,11 @@ async def test_seller_phrase_give_me_a_price_uses_default_offer(
     assert item_id == item.id
     await worker._process_item(item_id)
 
-    assert client.sent == ["老板能便宜一点吗", "我这边预算能到 73 元，您看方便吗？"]
+    assert client.sent == [
+        AVAILABILITY_OPENING,
+        NEGOTIATION_OPENING,
+        "我这边预算能到 73 元，您看方便吗？",
+    ]
 
 
 @pytest.mark.asyncio
@@ -608,7 +869,11 @@ async def test_price_request_without_reliable_price_asks_for_discount_without_ll
         assert row.status == QueueItemStatus.PARKED
         assert row.fail_code == "seller_timeout"
         assert row.result_summary == "等待卖家超时，已暂挂"
-    assert client.sent == ["老板能便宜一点吗", "老板您看最多能优惠多少钱？"]
+    assert client.sent == [
+        AVAILABILITY_OPENING,
+        NEGOTIATION_OPENING,
+        "老板您看最多能优惠多少钱？",
+    ]
 
 
 @pytest.mark.asyncio
@@ -646,7 +911,7 @@ async def test_unsafe_ai_continue_message_fails_closed_without_sending_it(
         assert row is not None
         assert row.status == QueueItemStatus.FAILED
         assert row.fail_code == "decision_draft_blocked"
-    assert client.sent == ["老板能便宜一点吗"]
+    assert client.sent == [AVAILABILITY_OPENING, NEGOTIATION_OPENING]
 
 
 @pytest.mark.asyncio
@@ -681,7 +946,7 @@ async def test_historical_seller_message_does_not_trigger_second_send_after_time
         assert row is not None
         assert row.status == QueueItemStatus.PARKED
         assert row.rounds_sent == 1
-        assert client.sent == ["老板还能便宜吗"]
+        assert client.sent == [AVAILABILITY_OPENING]
 
 
 @pytest.mark.asyncio
@@ -821,7 +1086,9 @@ async def test_page_confirmed_send_without_transport_body_is_persisted(
         assert row is not None
         assert row.status == QueueItemStatus.PARKED
         assert row.rounds_sent == 1
-        assert [message.text for message in repo.list_messages(item.id)] == ["你好"]
+        persisted = [message.text for message in repo.list_messages(item.id)]
+        assert len(persisted) == 1
+        assert persisted[0].replace(",", "，").replace("?", "？") == AVAILABILITY_OPENING
 
 
 @pytest.mark.asyncio
@@ -855,7 +1122,9 @@ async def test_confirmed_send_is_persisted_when_immediate_rescan_is_empty(
         assert row is not None
         assert row.status == QueueItemStatus.PARKED
         assert row.rounds_sent == 1
-        assert [message.text for message in repo.list_messages(item.id)] == ["你好"]
+        persisted = [message.text for message in repo.list_messages(item.id)]
+        assert len(persisted) == 1
+        assert persisted[0].replace(",", "，").replace("?", "？") == AVAILABILITY_OPENING
 
 
 @pytest.mark.asyncio

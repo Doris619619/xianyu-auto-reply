@@ -40,8 +40,10 @@ _COMPLETE_JSON_CODE_FENCE = re.compile(
 _PLAIN_AMOUNT = re.compile(r"(?<!\d)\d{1,9}(?:\.\d{1,2})?(?!\d)")
 
 Speaker = Literal["me", "seller"]
-NegotiationAction = Literal["continue", "agreed", "refused"]
+NegotiationAction = Literal["continue", "available", "unavailable", "agreed", "refused"]
 NegotiationReasonCode = Literal[
+    "in_stock",
+    "out_of_stock",
     "price_cut",
     "other_concession",
     "no_concession",
@@ -117,7 +119,7 @@ class LlmDecisionOutputError(LlmOutputError):
 
 class NegotiationDecision(BaseModel):
     """
-    表示模型对一轮卖家回复的唯一可执行裁决。
+    表示模型对一轮卖家回复的唯一可执行库存或议价裁决。
 
     终态不携带外发文本；只有 continue 可以给出下一条消息。该模型只校验结构，
     发送前仍必须经过既有硬性安全规则和页面确认。
@@ -150,6 +152,10 @@ class NegotiationDecision(BaseModel):
             return self
         if self.message is not None or self.offer_price_yuan is not None:
             raise ValueError("终态裁决不得携带 message 或 offer_price_yuan")
+        if self.action == "available" and self.reason_code == "in_stock":
+            return self
+        if self.action == "unavailable" and self.reason_code == "out_of_stock":
+            return self
         if self.action == "agreed" and self.reason_code in {
             "price_cut",
             "other_concession",

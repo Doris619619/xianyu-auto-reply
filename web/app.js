@@ -7,6 +7,7 @@ const statusLabel = {
   queued: "排队中",
   active: "进行中",
   parked: "暂挂",
+  done_unavailable: "已无货",
   done_agreed: "已谈成",
   done_refused: "未谈成",
   done_manual: "已手动结束",
@@ -27,6 +28,22 @@ function productPriceHint(item) {
     return `商品主价 ¥${item.list_price_yuan}（${source}）`;
   }
   return "商品主价未读取";
+}
+
+function conversationSignalHint(item) {
+  const availability =
+    item.goods_available === true
+      ? "库存：有货"
+      : item.goods_available === false
+        ? "库存：无货"
+        : "库存：待确认";
+  const phase =
+    item.conversation_phase === "availability"
+      ? "阶段：查库存"
+      : item.conversation_phase === "negotiation"
+        ? "阶段：议价"
+        : "阶段：已结束";
+  return `${availability} · ${phase} · over=${item.over === true ? "true" : "false"}`;
 }
 
 async function api(path, options = {}) {
@@ -117,6 +134,7 @@ async function refreshQueue() {
         </div>
         <div class="hint">ID ${item.item_id} · 已发 ${item.rounds_sent} 轮
           ${item.result_summary ? " · " + item.result_summary : ""}</div>
+        <div class="hint">${conversationSignalHint(item)}</div>
         <div class="hint">${productPriceHint(item)}</div>
         ${sendDiagnosticHint(item.send_diagnostic)}
         <div class="item-actions">${actions.join("")}</div>
