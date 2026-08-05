@@ -20,6 +20,7 @@ class QueueItemStatus(StrEnum):
     QUEUED = "queued"
     ACTIVE = "active"
     PARKED = "parked"
+    DONE_UNAVAILABLE = "done_unavailable"
     DONE_AGREED = "done_agreed"
     DONE_REFUSED = "done_refused"
     DONE_MANUAL = "done_manual"
@@ -49,6 +50,9 @@ class QueueItem(Base):
     position: Mapped[int] = mapped_column(Integer, index=True, default=0)
     seller_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     processing_reply_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    conversation_phase: Mapped[str] = mapped_column(String(32), default="availability")
+    goods_available: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    over: Mapped[bool] = mapped_column(Boolean, default=False)
     result_summary: Mapped[str | None] = mapped_column(String(512), nullable=True)
     fail_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     send_diagnostic: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -142,6 +146,22 @@ def _upgrade_sqlite_schema(engine, database_url: str) -> None:
         if "price_source" not in item_columns:
             connection.exec_driver_sql(
                 "ALTER TABLE queue_items ADD COLUMN price_source VARCHAR(32)"
+            )
+        if "conversation_phase" not in item_columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE queue_items ADD COLUMN conversation_phase VARCHAR(32) "
+                "NOT NULL DEFAULT 'availability'"
+            )
+            if "rounds_sent" in item_columns:
+                connection.exec_driver_sql(
+                    "UPDATE queue_items SET conversation_phase = 'negotiation' "
+                    "WHERE rounds_sent > 0"
+                )
+        if "goods_available" not in item_columns:
+            connection.exec_driver_sql("ALTER TABLE queue_items ADD COLUMN goods_available BOOLEAN")
+        if "over" not in item_columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE queue_items ADD COLUMN over BOOLEAN NOT NULL DEFAULT 0"
             )
 
 

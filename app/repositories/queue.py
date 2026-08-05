@@ -185,6 +185,14 @@ class QueueRepository:
         """更新队列项终态或暂挂状态。"""
 
         item.status = status
+        if status in {
+            QueueItemStatus.DONE_UNAVAILABLE,
+            QueueItemStatus.DONE_AGREED,
+            QueueItemStatus.DONE_REFUSED,
+            QueueItemStatus.DONE_MANUAL,
+        }:
+            item.conversation_phase = "finished"
+            item.over = True
         if summary is not None:
             item.result_summary = summary
         if fail_code is not None:
@@ -228,6 +236,28 @@ class QueueRepository:
         """保存可选商品标题。"""
 
         item.title = title
+        item.updated_at = datetime.now(UTC)
+        self._session.commit()
+        self._session.refresh(item)
+        return item
+
+    def set_conversation_state(
+        self,
+        item: QueueItem,
+        *,
+        phase: str,
+        goods_available: bool | None = None,
+    ) -> QueueItem:
+        """
+        保存可恢复的对话阶段及已确认的库存信号。
+
+        参数 ``phase`` 由上层状态机传入；仅在 ``goods_available`` 非空时更新库存结果。
+        副作用为提交当前队列项，供超时重试或服务重启后继续同一阶段。
+        """
+
+        item.conversation_phase = phase
+        if goods_available is not None:
+            item.goods_available = goods_available
         item.updated_at = datetime.now(UTC)
         self._session.commit()
         self._session.refresh(item)

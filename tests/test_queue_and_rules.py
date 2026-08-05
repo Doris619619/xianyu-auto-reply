@@ -48,6 +48,9 @@ def test_init_db_upgrades_legacy_queue_table_with_send_diagnostic(tmp_path: Path
     assert "send_diagnostic" in columns
     assert "list_price_yuan" in columns
     assert "price_source" in columns
+    assert "conversation_phase" in columns
+    assert "goods_available" in columns
+    assert "over" in columns
 
 
 def test_product_price_context_is_persisted_and_exposed(session_factory: sessionmaker) -> None:
@@ -70,6 +73,26 @@ def test_product_price_context_is_persisted_and_exposed(session_factory: session
     assert out.title == "测试商品"
     assert str(out.list_price_yuan) == "86.00"
     assert out.price_source == "dom_main"
+
+
+def test_conversation_signals_are_exposed_in_queue_snapshot(
+    session_factory: sessionmaker,
+) -> None:
+    """本地队列 API 快照必须携带库存、阶段和结束信号。"""
+
+    service = QueueService(session_factory)
+    item = service.enqueue("1067489371527")
+    with session_factory() as session:
+        repo = QueueRepository(session)
+        row = repo.claim_next_queued()
+        assert row is not None and row.id == item.id
+        repo.set_conversation_state(row, phase="negotiation", goods_available=True)
+        repo.mark_status(row, QueueItemStatus.DONE_REFUSED, summary="refused")
+
+    out = service.list_queue().items[0]
+    assert out.conversation_phase == "finished"
+    assert out.goods_available is True
+    assert out.over is True
 
 
 def test_parse_item_id_only() -> None:

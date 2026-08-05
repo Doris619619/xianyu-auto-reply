@@ -27,13 +27,18 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你在闲鱼上以买家本人的身份和�
 根据完整聊天记录，判断本轮应继续沟通还是结束任务。
 你只能输出一个 JSON 对象，不能输出 Markdown、代码块或任何解释：
 {{
-  "action": "continue|agreed|refused",
-  "reason_code": "price_cut|other_concession|no_concession|uncertain",
+  "action": "continue|available|unavailable|agreed|refused",
+  "reason_code": "in_stock|out_of_stock|price_cut|other_concession|no_concession|uncertain",
   "message": "string or null",
   "offer_price_yuan": "integer or null"
 }}
 
-裁决规则：
+当前对话阶段：{phase_name}
+
+阶段规则：
+{phase_rules}
+
+议价规则：
 1. 卖家明确降价、报出更低价格：action 为 agreed，reason_code 为 price_cut，
    message 必须为 null。
 2. 卖家明确提供包邮、赠品或其他让利：action 为 agreed，
@@ -46,7 +51,8 @@ DECISION_SYSTEM_PROMPT_TEMPLATE = """你在闲鱼上以买家本人的身份和�
 5. 不要主动报具体金额；仅当卖家明确问买家能出多少时，才可填写 offer_price_yuan，
    此时 message 必须为 null。其他 continue 必须让 offer_price_yuan 为 null，且 message 不得含金额。
 6. 商品标价未知时绝不填写 offer_price_yuan，只追问卖家最低价。
-7. 不要为了礼貌在 agreed 或 refused 时生成感谢、告别或任何消息；终态只返回 over 信号。
+7. 不要为了礼貌在 available、unavailable、agreed 或 refused 时生成感谢、告别或任何消息；
+   终态只返回信号。
 
 不可违反的硬性约束：
 {constraints}
@@ -98,6 +104,25 @@ FOLLOW_UP_NUDGE = "（卖家暂时没有新的回复。请基于目前的进展�
 
 UNKNOWN_TITLE = "未提供（可参考聊天记录里的商品卡片）"
 
+_AVAILABILITY_PHASE = "availability"
+_NEGOTIATION_PHASE = "negotiation"
+_PHASE_RULES = {
+    _AVAILABILITY_PHASE: (
+        "1. 卖家明确说商品还在、有货、可以出或仍在售：action 必须为 available，"
+        "reason_code 必须为 in_stock，message 和 offer_price_yuan 必须为 null。\n"
+        "2. 卖家明确说已卖、没货、下架或不在了：action 必须为 unavailable，"
+        "reason_code 必须为 out_of_stock，message 和 offer_price_yuan 必须为 null。\n"
+        "3. 不能明确判断库存时：action 必须为 continue，reason_code 为 uncertain；"
+        "message 只能追问商品是否还在，不得议价、报金额或承诺购买。\n"
+        "4. 此阶段绝不能返回 agreed 或 refused。"
+    ),
+    _NEGOTIATION_PHASE: (
+        "1. 卖家在议价过程中明确说已卖、没货、下架或不在了：action 必须为 unavailable，"
+        "reason_code 必须为 out_of_stock，message 和 offer_price_yuan 必须为 null。\n"
+        "2. 其余情况按下面的议价规则裁决；此阶段不能返回 available。"
+    ),
+}
+
 
 def build_system_prompt(goal: str) -> str:
     """
@@ -114,21 +139,25 @@ def build_system_prompt(goal: str) -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(goal=normalized, constraints=constraints)
 
 
-def build_decision_system_prompt(goal: str) -> str:
+def build_decision_system_prompt(goal: str, *, phase: str = _NEGOTIATION_PHASE) -> str:
     """
     根据本次目标拼出结构化议价裁决提示词。
 
-    参数 goal 是本轮议价目标；返回只允许模型输出决策 JSON 的 system 提示词。
-    本函数不调用模型、不访问页面，也不包含任何发送副作用。
+    参数 goal 是本轮议价目标，phase 是持久化的库存或议价阶段；返回只允许模型输出决策 JSON
+    的 system 提示词。未知阶段抛出 ValueError。本函数不调用模型、不访问页面，也不包含发送副作用。
     """
 
     normalized = goal.strip()
     if not normalized:
         raise ValueError("对话目标不能为空")
+    if phase not in _PHASE_RULES:
+        raise ValueError("对话阶段无效")
     constraints = "\n".join(f"- {item}" for item in HARD_CONSTRAINTS)
     return DECISION_SYSTEM_PROMPT_TEMPLATE.format(
         goal=normalized,
         constraints=constraints,
+        phase_name="库存确认" if phase == _AVAILABILITY_PHASE else "议价",
+        phase_rules=_PHASE_RULES[phase],
     )
 
 

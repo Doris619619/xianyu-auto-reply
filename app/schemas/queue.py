@@ -13,6 +13,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 ReplyMode = Literal["ai", "manual"]
+ConversationPhase = Literal["availability", "negotiation", "finished"]
 
 
 class EnqueueRequest(BaseModel):
@@ -62,6 +63,9 @@ class QueueItemOut(BaseModel):
     position_rank: int | None = None
     seller_id: str | None
     processing_reply_mode: ReplyMode | None = None
+    conversation_phase: ConversationPhase
+    goods_available: bool | None
+    over: bool
     result_summary: str | None
     fail_code: str | None
     send_diagnostic: SendDiagnosticOut | None = None

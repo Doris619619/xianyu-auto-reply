@@ -13,7 +13,8 @@
 
 ### `GET /api/items`
 
-返回全部队列项、`worker_enabled`、`active_id`。
+返回全部队列项、`worker_enabled`、`active_id`。每个队列项还包含可供本地或后续服务消费的
+`conversation_phase`、`goods_available`（`true` / `false` / `null`）和 `over` 信号。
 
 ### `DELETE /api/items`
 

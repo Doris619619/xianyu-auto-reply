@@ -59,6 +59,33 @@ def test_parse_decision_accepts_other_concession_as_agreed() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("content", "action", "reason_code"),
+    [
+        (
+            '{"action":"available","reason_code":"in_stock","message":null}',
+            "available",
+            "in_stock",
+        ),
+        (
+            '{"action":"unavailable","reason_code":"out_of_stock","message":null}',
+            "unavailable",
+            "out_of_stock",
+        ),
+    ],
+)
+def test_parse_decision_accepts_inventory_terminal_signals(
+    content: str, action: str, reason_code: str
+) -> None:
+    """库存终态只能返回信号，不能携带待发送的文本或报价。"""
+
+    decision = _generator()._parse_decision(_response(content))
+
+    assert decision.action == action
+    assert decision.reason_code == reason_code
+    assert decision.message is None
+    assert decision.offer_price_yuan is None
+
 def test_parse_decision_accepts_complete_json_code_fence() -> None:
     """完整 JSON 代码块可兼容解析，但不会放宽字段与终态约束。"""
 
@@ -215,6 +242,9 @@ def test_decision_rejects_uncontrolled_numeric_offer(content: str) -> None:
         '{"action":"agreed","reason_code":"price_cut","message":"谢谢"}',
         '{"action":"continue","reason_code":"uncertain","message":null}',
         '{"action":"refused","reason_code":"other_concession","message":null}',
+        '{"action":"available","reason_code":"in_stock","message":"还在"}',
+        '{"action":"unavailable","reason_code":"out_of_stock","offer_price_yuan":1}',
+        '{"action":"available","reason_code":"out_of_stock","message":null}',
         '{"action":"unknown","reason_code":"uncertain","message":"再问问"}',
         '["action", "agreed"]',
         '```json\n{"action":"agreed","reason_code":"price_cut","message":null}\n```\n解释',

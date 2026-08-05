@@ -50,6 +50,10 @@ decision_diagnostic_logger = logging.getLogger("app.decision_diagnostic")
 
 SLEEP_CALLABLE = Callable[[float], Awaitable[None]]
 UNKNOWN_PRICE_FOLLOW_UP = "老板您看最多能优惠多少钱？"
+AVAILABILITY_OPENING = "老板，这个还在吗？"
+NEGOTIATION_OPENING = "好的，那可以便宜一点吗？"
+AVAILABILITY_PHASE = "availability"
+NEGOTIATION_PHASE = "negotiation"
 _SELLER_ASKS_BUYER_PRICE = re.compile(
     r"(?:出多少|能出多少|多少能出|预算多少|给(?:我)?个价(?:格)?|开(?:个)?价|"
     r"你说(?:个)?价|你报(?:个)?价|多少钱要|最低能给多少)",
@@ -550,8 +554,13 @@ class BargainWorker:
             )
             return
 
-        # 新任务：先发议价，再等卖家。
-        send_result = await self._send_one_round(item_id, session_obj, skip_first=skip_first)
+        # 新任务必须先确认商品仍在售；库存确认前绝不生成或发送议价话术。
+        send_result = await self._send_draft(
+            item_id=item_id,
+            session_obj=session_obj,
+            text=AVAILABILITY_OPENING,
+            skip_first=skip_first,
+        )
         if send_result == "seller_reply":
             if (
                 await self._respond_to_seller(
@@ -776,16 +785,55 @@ class BargainWorker:
         skip_first: int,
     ) -> str:
         """
-        根据完整会话执行一次 AI 结构化裁决，并发送唯一允许的继续消息。
+        根据当前库存或议价阶段执行一次 AI 结构化裁决，并发送唯一允许的继续消息。
 
-        agreed / refused 只写终态信号、不再发送；continue 的消息仍需通过硬性安全扫描。
-        如果发送后已同步到新的卖家消息，会立即按该新消息再裁决，避免丢失快速回复。
+        无货、谈成或谈不成只写终态信号、不再发送；continue 的消息仍需通过硬性安全扫描。
+        库存确认后固定发送首次议价问题；如果发送后已同步到新的卖家消息，会立即按该新消息再裁决。
         """
 
         while True:
             if self._should_abort(item_id):
                 return "done"
-            if _seller_explicitly_asks_buyer_price(session_obj.transcript):
+            phase = self._current_conversation_phase(item_id)
+            if phase == AVAILABILITY_PHASE:
+                proposal = await session_obj.next_decision(
+                    system_prompt=build_decision_system_prompt(
+                        DEFAULT_GOAL, phase=AVAILABILITY_PHASE
+                    )
+                )
+                decision = proposal.decision
+                if decision.action == "unavailable":
+                    self._finish_unavailable(item_id)
+                    return "done"
+                if decision.action == "available":
+                    self._mark_goods_available(item_id)
+                    send_result = await self._send_draft(
+                        item_id=item_id,
+                        session_obj=session_obj,
+                        text=NEGOTIATION_OPENING,
+                        skip_first=skip_first,
+                    )
+                    if send_result != "seller_reply":
+                        return send_result
+                    continue
+                if decision.action != "continue":
+                    self._park_for_ai_unavailable(
+                        item_id,
+                        "库存确认裁决与当前阶段不匹配，未发送消息；可重新裁决（不重发）",
+                        "availability_phase_decision_invalid",
+                    )
+                    return "done"
+                if decision.offer_price_yuan is not None:
+                    self._park_for_ai_unavailable(
+                        item_id,
+                        "库存确认阶段不允许报价，未发送消息；可重新裁决（不重发）",
+                        "availability_phase_offer_invalid",
+                    )
+                    return "done"
+                text = decision.message
+            elif phase != NEGOTIATION_PHASE:
+                return "done"
+            elif _seller_explicitly_asks_buyer_price(session_obj.transcript):
                 text = self._render_default_price_offer(session_obj.product)
                 if text is None:
                     text = UNKNOWN_PRICE_FOLLOW_UP
@@ -798,32 +846,47 @@ class BargainWorker:
                 if send_result != "seller_reply":
                     return send_result
                 continue
-            proposal = await session_obj.next_decision()
-            decision = proposal.decision
-            if decision.action != "continue":
-                self._finish_from_decision(item_id, decision)
-                return "done"
-            text = decision.message
-            if decision.offer_price_yuan is not None:
-                if not _seller_explicitly_asks_buyer_price(session_obj.transcript):
+            else:
+                proposal = await session_obj.next_decision(
+                    system_prompt=build_decision_system_prompt(
+                        DEFAULT_GOAL, phase=NEGOTIATION_PHASE
+                    )
+                )
+                decision = proposal.decision
+                if decision.action == "unavailable":
+                    self._finish_unavailable(item_id)
+                    return "done"
+                if decision.action in {"agreed", "refused"}:
+                    self._finish_from_decision(item_id, decision)
+                    return "done"
+                if decision.action != "continue":
                     self._park_for_ai_unavailable(
                         item_id,
-                        "卖家未明确要求报价，未发送消息；可重新裁决（不重发）",
-                        "offer_without_seller_price_request",
+                        "议价裁决与当前阶段不匹配，未发送消息；可重新裁决（不重发）",
+                        "negotiation_phase_decision_invalid",
                     )
                     return "done"
-                text = self._render_price_offer(decision.offer_price_yuan, session_obj.product)
-                if text is None:
-                    self._park_for_ai_unavailable(
-                        item_id,
-                        "报价不在可靠标价范围内，未发送消息；可重新裁决（不重发）",
-                        "offer_outside_reliable_price_range",
-                    )
-                    return "done"
+                text = decision.message
+                if decision.offer_price_yuan is not None:
+                    if not _seller_explicitly_asks_buyer_price(session_obj.transcript):
+                        self._park_for_ai_unavailable(
+                            item_id,
+                            "卖家未明确要求报价，未发送消息；可重新裁决（不重发）",
+                            "offer_without_seller_price_request",
+                        )
+                        return "done"
+                    text = self._render_price_offer(decision.offer_price_yuan, session_obj.product)
+                    if text is None:
+                        self._park_for_ai_unavailable(
+                            item_id,
+                            "报价不在可靠标价范围内，未发送消息；可重新裁决（不重发）",
+                            "offer_outside_reliable_price_range",
+                        )
+                        return "done"
             assert text is not None
             findings = (
                 proposal.findings
-                if decision.message is not None
+                if proposal is not None and decision is not None and decision.message is not None
                 else scan_outbound_draft(text)
             )
             if findings:
@@ -892,6 +955,41 @@ class BargainWorker:
                 return reply
             waited += chunk
         return None
+
+    def _current_conversation_phase(self, item_id: int) -> str:
+        """读取当前持久化阶段，避免重试或重启后重复库存、议价开场。"""
+
+        with self.session_factory() as session:
+            item = QueueRepository(session).get_item(item_id)
+            return item.conversation_phase if item is not None else "finished"
+
+    def _mark_goods_available(self, item_id: int) -> None:
+        """记录卖家确认有货并切换到议价阶段，不结束当前会话。"""
+
+        with self.session_factory() as session:
+            repo = QueueRepository(session)
+            item = repo.get_item(item_id)
+            if item is not None and item.status == QueueItemStatus.ACTIVE:
+                repo.set_conversation_state(
+                    item,
+                    phase=NEGOTIATION_PHASE,
+                    goods_available=True,
+                )
+
+    def _finish_unavailable(self, item_id: int) -> None:
+        """将明确无货结果写入 goods_available=false 与 over=true 的终态。"""
+
+        with self.session_factory() as session:
+            repo = QueueRepository(session)
+            item = repo.get_item(item_id)
+            if item is not None and item.status == QueueItemStatus.ACTIVE:
+                item.goods_available = False
+                repo.mark_status(
+                    item,
+                    QueueItemStatus.DONE_UNAVAILABLE,
+                    summary="AI 判定：商品已无货或不再售卖",
+                    fail_code="goods_unavailable",
+                )
 
     def _finish_from_decision(self, item_id: int, decision: NegotiationDecision) -> None:
         """将 AI 的终态裁决写入兼容的队列结束信号，不记录卖家原文。"""
